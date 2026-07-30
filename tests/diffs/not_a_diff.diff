@@ -1,0 +1,4 @@
+This file is prose, not a unified diff.
+
+It exists so the parser proves it rejects a wrong file or a broken pipe
+instead of quietly reporting that there was nothing to review.

@@ -1,0 +1,7 @@
+diff --git a/src/broken.py b/src/broken.py
+index aaaaaaa..bbbbbbb 100644
+--- a/src/broken.py
++++ b/src/broken.py
+@@ -1,4 +1,9 @@
+ x = 1
++y = 2

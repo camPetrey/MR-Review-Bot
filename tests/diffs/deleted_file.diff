@@ -1,0 +1,11 @@
+diff --git a/src/legacy/old_auth.py b/src/legacy/old_auth.py
+deleted file mode 100644
+index abc1234..0000000
+--- a/src/legacy/old_auth.py
++++ /dev/null
+@@ -1,5 +0,0 @@
+-def check(user):
+-    if user.is_admin:
+-        return True
+-    return False
+-
