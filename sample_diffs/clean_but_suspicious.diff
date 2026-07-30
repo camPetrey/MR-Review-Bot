@@ -1,0 +1,47 @@
+diff --git a/src/app/accounts.py b/src/app/accounts.py
+index 7a2c9e4..4d8b1f6 100644
+--- a/src/app/accounts.py
++++ b/src/app/accounts.py
+@@ -1,11 +1,20 @@
+ import hashlib
+ import secrets
+
+ from .db import get_conn
+
+ ALLOWED_REDIRECTS = {"/home", "/dashboard", "/settings"}
+
++USER_LOOKUP_SQL = "SELECT id, email FROM users WHERE id = %s"
++
++
++def find_user(uid):
++    cur = get_conn().cursor()
++    cur.execute(USER_LOOKUP_SQL, (uid,))
++    return cur.fetchone()
++
++
+ def new_csrf_token():
+     return secrets.token_hex(32)
+
+
+diff --git a/src/app/views/redirects.py b/src/app/views/redirects.py
+index 8c3a1d7..2b9e5f4 100644
+--- a/src/app/views/redirects.py
++++ b/src/app/views/redirects.py
+@@ -1,10 +1,17 @@
+ from flask import redirect, request
+
+ import hashlib
+
+ from ..accounts import ALLOWED_REDIRECTS
+
++
++def safe_next():
++    target = request.args.get("next", "/home")
++    if target not in ALLOWED_REDIRECTS:
++        target = "/home"
++    return redirect(target)
++
+
+ def fingerprint(payload):
+     return hashlib.sha256(payload).hexdigest()
+
