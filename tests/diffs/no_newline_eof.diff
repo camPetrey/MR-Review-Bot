@@ -1,0 +1,10 @@
+diff --git a/src/app/tail.py b/src/app/tail.py
+index 8888888..9999999 100644
+--- a/src/app/tail.py
++++ b/src/app/tail.py
+@@ -1,2 +1,2 @@
+ alpha
+-beta
+\ No newline at end of file
++gamma
+\ No newline at end of file
