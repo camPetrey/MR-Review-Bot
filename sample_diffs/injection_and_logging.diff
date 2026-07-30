@@ -1,0 +1,28 @@
+diff --git a/src/app/db/users.py b/src/app/db/users.py
+index 2f8a1c3..6e9d7b4 100644
+--- a/src/app/db/users.py
++++ b/src/app/db/users.py
+@@ -1,10 +1,10 @@
+ import logging
+
+ log = logging.getLogger(__name__)
+
+
+ def find_user(conn, uid):
+     cur = conn.cursor()
+-    cur.execute("SELECT * FROM users WHERE id = %s", (uid,))
++    cur.execute(f"SELECT * FROM users WHERE id = {uid}")
+     return cur.fetchone()
+
+diff --git a/src/app/auth/session.py b/src/app/auth/session.py
+index 4b7c2e9..8a3f1d6 100644
+--- a/src/app/auth/session.py
++++ b/src/app/auth/session.py
+@@ -12,6 +12,7 @@ from .tokens import create_token
+ def issue_session(user):
+     token = create_token(user)
+     store.save(user.id, token)
++    log.info("issued session token=%s for %s", token, user.email)
+     return token
+
+
