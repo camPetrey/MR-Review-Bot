@@ -50,9 +50,16 @@ def fake_llm(monkeypatch):
 def run(args: list[str], capsys) -> tuple[int, dict, str]:
     """Run the CLI and return `(exit code, parsed JSON output, stderr)`.
 
+    Forces `--format json` unless the caller chose one. §14 defaults to Markdown for the
+    human reading a PR, but the JSON is the source of truth (§10) and is what these
+    assertions are about — going through the rendered Markdown would test the renderer's
+    phrasing instead of the pipeline's behaviour. `test_renderer.py` covers the Markdown.
+
     `--dry-run` prints prompts rather than JSON, so a decode failure yields `{}` instead of
     erroring — tests that use it assert on the exit code and on what was sent.
     """
+    if "--format" not in args:
+        args = [*args, "--format", "json"]
     code = cli.main(args)
     captured = capsys.readouterr()
     try:
@@ -326,6 +333,78 @@ def test_output_file_is_written(capsys, fake_llm, tmp_path) -> None:
 
     assert code == cli.EXIT_OK
     assert json.loads(target.read_text())["findings"]
+
+
+# ------------------------------------------------------------------------------------
+# --format (§14)
+# ------------------------------------------------------------------------------------
+
+
+def test_markdown_is_the_default_format(capsys, fake_llm) -> None:
+    """§14: the default reader is a human looking at a PR."""
+    fake_llm(review_json(), summary_json())
+    cli.main([str(SAMPLE_DIFFS / "auth_bypass.diff")])
+    out = capsys.readouterr().out
+
+    assert out.startswith("# Security review")
+    assert "## `src/app/views/admin.py`" in out, "grouped under a file heading (§13)"
+
+
+def test_format_both_writes_markdown_and_json_side_by_side(capsys, fake_llm, tmp_path) -> None:
+    """CI uploads review.md and review.json as artifacts from one run (§18)."""
+    fake_llm(review_json(), summary_json())
+    target = tmp_path / "review.md"
+    code = cli.main(
+        [str(SAMPLE_DIFFS / "auth_bypass.diff"), "--format", "both", "--output", str(target)]
+    )
+
+    assert code == cli.EXIT_OK
+    assert target.read_text().startswith("# Security review")
+    assert json.loads((tmp_path / "review.json").read_text())["findings"]
+
+
+def test_format_both_to_stdout_emits_both(capsys, fake_llm) -> None:
+    fake_llm(review_json(), summary_json())
+    cli.main([str(SAMPLE_DIFFS / "auth_bypass.diff"), "--format", "both"])
+    out = capsys.readouterr().out
+
+    assert "# Security review" in out
+    assert json.loads(out[out.index("{") :])["findings"]
+
+
+def test_markdown_and_json_report_the_same_findings(capsys, fake_llm) -> None:
+    """The Markdown is a projection of the JSON, so nothing may be dropped in rendering."""
+    fake_llm(review_json(), summary_json())
+    cli.main([str(SAMPLE_DIFFS / "auth_bypass.diff"), "--format", "both"])
+    out = capsys.readouterr().out
+    payload = json.loads(out[out.index("{") :])
+
+    assert out.count("\n### ") == len(payload["findings"]), "every finding renders (§13)"
+
+
+def test_empty_diff_still_renders_markdown(capsys, fake_llm) -> None:
+    """The no-reviewable-changes path returns early, so it renders through its own branch."""
+    fake_llm(review_json(), summary_json())
+    code = cli.main(["tests/diffs/empty.diff"])
+    out = capsys.readouterr().out
+
+    assert code == cli.EXIT_OK
+    assert "**No findings.**" in out
+
+
+def test_verbose_reports_stage_timings(capsys, fake_llm) -> None:
+    fake_llm(review_json(), summary_json())
+    _, _, err = run([str(SAMPLE_DIFFS / "auth_bypass.diff"), "--verbose"], capsys)
+
+    assert "timings:" in err
+    for stage in ("parse", "mask", "scan", "pack", "merge", "render", "total"):
+        assert stage in err
+
+
+def test_timings_are_not_reported_without_verbose(capsys, fake_llm) -> None:
+    fake_llm(review_json(), summary_json())
+    _, _, err = run([str(SAMPLE_DIFFS / "auth_bypass.diff")], capsys)
+    assert "timings:" not in err
 
 
 def test_output_is_stable_across_identical_runs(capsys, fake_llm) -> None:

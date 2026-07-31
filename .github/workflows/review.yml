@@ -1,0 +1,96 @@
+# The bot reviews the PR that triggered it (SPEC.md §18).
+#
+# Advisory only, by construction:
+#   - `continue-on-error: true`, so a bot failure never blocks the pipeline
+#   - no `--fail-on`, so findings never fail the job
+#   - output goes to the job summary and to artifacts; it does not post a PR comment,
+#     which §1 puts out of scope
+#
+# It runs on `pull_request`, not `pull_request_target`. That matters: `pull_request` runs
+# the workflow from the base branch without repository secrets on a fork PR, so an attacker
+# cannot open a PR that exfiltrates ANTHROPIC_API_KEY. §3 treats the diff as attacker
+# controlled, and the same author controls the workflow file on a fork. Fork PRs therefore
+# skip the LLM and still get the deterministic layer, which never needed a key (§12).
+
+name: review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The bot diffs against the base branch, so the merge-base has to exist locally.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -e .
+
+      - name: Fetch base branch
+        run: git fetch --no-tags origin ${{ github.base_ref }}
+
+      # A fork PR gets no secrets. Rather than fail on a missing key, drop to --no-llm:
+      # deterministic findings never depended on a network call (§12), so a partial review
+      # is strictly better than none, and the header says the coverage is partial.
+      - name: Select mode
+        id: mode
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "flags=" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No ANTHROPIC_API_KEY available (fork PR). Deterministic findings only."
+            echo "flags=--no-llm" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Review the diff
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD \
+            | review-bot - \
+                --format both \
+                --output review.md \
+                --verbose \
+                ${{ steps.mode.outputs.flags }}
+
+      # §11: unmappable_count and hallucinated_file_count go into the CI job output. They
+      # are the tuning metrics, and a run nobody reads is how they drift.
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f review.md ]; then
+            cat review.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The review did not produce output. See the step log above." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review
+          path: |
+            review.md
+            review.json
+          if-no-files-found: warn

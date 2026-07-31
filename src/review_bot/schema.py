@@ -259,16 +259,6 @@ class ValidationStats:
     hallucinated_files: list[str] = field(default_factory=list)
     unmappable_lines: list[tuple[str, int]] = field(default_factory=list)
 
-    @property
-    def total_rejected(self) -> int:
-        return self.hallucinated_file_count
-
-    def as_dict(self) -> dict:
-        return {
-            "unmappable_count": self.unmappable_count,
-            "hallucinated_file_count": self.hallucinated_file_count,
-        }
-
 
 def validate_findings(
     findings: list[Finding], diff: ParsedDiff

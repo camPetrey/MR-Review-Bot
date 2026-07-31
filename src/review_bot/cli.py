@@ -10,8 +10,8 @@ constructed, so no raw diff content can reach the API (invariant 1). Determinist
 are collected before the first call and are emitted whether or not that call succeeds
 (invariant 3, §12).
 
-**M4 scope note:** `renderer.py` is M5, so `--format` is JSON-only here. The remaining
-flags of §14 that depend on rendering (`--format markdown|both`) land with that module.
+Timing is collected here for the same reason: a stage boundary is the only place that knows
+where one stage ends and the next begins. `--verbose` reports it (§14).
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from .diff_parser import DiffParseError, ParsedDiff, parse_diff
@@ -40,6 +42,7 @@ from .prompt_builder import (
     filter_files,
     pack,
 )
+from .renderer import render_markdown
 from .role_scanner import register_suppressions, scan_diff
 from .schema import (
     Finding,
@@ -76,9 +79,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIFF_PATH",
         help="Path to a unified diff, or '-' to read stdin. No git invocation (§14).",
     )
-    parser.add_argument("--format", choices=["json"], default="json",
-                        help="Output format. Markdown lands with renderer.py in M5.")
-    parser.add_argument("--output", metavar="PATH", help="Write output to a file (default stdout)")
+    parser.add_argument("--format", choices=["markdown", "json", "both"], default="markdown",
+                        help="Output format (§14). JSON is the source of truth either way.")
+    parser.add_argument("--output", metavar="PATH",
+                        help="Write output to a file (default stdout). With --format both, "
+                             "Markdown goes to PATH and JSON to PATH with a .json suffix.")
     parser.add_argument("--model", default=DEFAULT_REVIEW_MODEL, help="Override the review model")
     parser.add_argument("--summary-model", default=DEFAULT_SUMMARY_MODEL)
     parser.add_argument("--effort", choices=["low", "medium", "high"], default="medium")
@@ -100,9 +105,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    timings = Timings()
 
     try:
-        diff = parse_diff(_read_input(args.diff))
+        with timings("parse"):
+            diff = parse_diff(_read_input(args.diff))
     except DiffParseError as exc:
         print(f"error: could not parse diff: {exc}", file=sys.stderr)
         return EXIT_PARSE_ERROR
@@ -118,13 +125,16 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     # ---- Deterministic stages. These run before anything reaches the network. ----------
-    mask_result = mask_diff(diff)  # invariant 1: masks in place, before prompt_builder
-    scan_result = scan_diff(diff)
-    register_suppressions(scan_result, mask_result.findings)
+    with timings("mask"):
+        mask_result = mask_diff(diff)  # invariant 1: masks in place, before prompt_builder
+    with timings("scan"):
+        scan_result = scan_diff(diff)
+        register_suppressions(scan_result, mask_result.findings)
     deterministic: list[Finding] = mask_result.findings + scan_result.findings
 
-    filtered = filter_files(diff)
-    batches = pack(filtered.reviewable, args.max_input_tokens)
+    with timings("pack"):
+        filtered = filter_files(diff)
+        batches = pack(filtered.reviewable, args.max_input_tokens)
 
     llm_findings: list[Finding] = []
     stats = ValidationStats()
@@ -151,7 +161,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if not skip_llm:
         try:
-            llm_findings, stats = _review_pass(client, batches, scan_result.suppressed, diff)
+            with timings("review_pass"):
+                llm_findings, stats = _review_pass(client, batches, scan_result.suppressed, diff)
         except MalformedLLMResponse as exc:
             # §15: print the raw response verbatim and exit 2. No repair, no retry.
             print(f"error: {exc}", file=sys.stderr)
@@ -165,16 +176,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"warning: review pass failed, continuing without it: {exc}", file=sys.stderr)
             skip_llm = True
 
-    findings = merge_findings(deterministic, llm_findings)
+    with timings("merge"):
+        findings = merge_findings(deterministic, llm_findings)
 
     if not skip_llm:
         try:
-            raw = client.summarize(
-                build_summary_prompt(
-                    [f.path for f in filtered.reviewable], filtered.excluded, findings
+            with timings("summary_pass"):
+                raw = client.summarize(
+                    build_summary_prompt(
+                        [f.path for f in filtered.reviewable], filtered.excluded, findings
+                    )
                 )
-            )
-            summary = parse_summary_response(raw)
+                summary = parse_summary_response(raw)
         except MalformedLLMResponse as exc:
             print(f"error: {exc}", file=sys.stderr)
             print(exc.raw)
@@ -186,8 +199,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"warning: summary pass failed, continuing without it: {exc}", file=sys.stderr)
 
     review = _assemble(findings, summary, filtered)
-    _report_metrics(stats, filtered, client, args.verbose)
-    _emit(args, review)
+    with timings("render"):
+        rendered = _render(args, review, filtered.exclusion_summary())
+    _report_metrics(stats, filtered, client, timings, mask_result, args.verbose)
+    _write(args, rendered)
 
     if args.fail_on == "high" and any(f.severity == "high" for f in review.findings):
         return EXIT_FAIL_ON
@@ -285,7 +300,14 @@ def _assemble(findings: list[Finding], summary, filtered) -> Review:
     )
 
 
-def _report_metrics(stats: ValidationStats, filtered, client: LLMClient, verbose: bool) -> None:
+def _report_metrics(
+    stats: ValidationStats,
+    filtered,
+    client: LLMClient,
+    timings: Timings,
+    mask_result,
+    verbose: bool,
+) -> None:
     """§11: both counters go to stderr on every run and into the CI job output."""
     print(
         f"unmappable_count={stats.unmappable_count} "
@@ -294,6 +316,11 @@ def _report_metrics(stats: ValidationStats, filtered, client: LLMClient, verbose
     )
     if note := filtered.exclusion_summary():
         print(note, file=sys.stderr)
+    if verbose:
+        # Masking is the one stage whose success is invisible in the output: a run that
+        # masked nothing and a run whose masking silently no-opped look identical.
+        print(f"masked_line_count={mask_result.masked_line_count}", file=sys.stderr)
+        print(timings.report(), file=sys.stderr)
     if verbose and client.usages:
         print(client.usage_summary(), file=sys.stderr)
     if verbose and stats.unmappable_lines:
@@ -324,12 +351,85 @@ def _empty_review(reason: str) -> Review:
     )
 
 
+def _to_json(review: Review) -> str:
+    """`sort_keys=True` so a fixture diff shows a content change, never a key reordering."""
+    return json.dumps(review.public_dict(), indent=2, sort_keys=True, ensure_ascii=False)
+
+
+def _render(args, review: Review, excluded_note: str = "") -> dict[str, str]:
+    """Produce every artifact `--format` asked for, keyed by extension."""
+    artifacts: dict[str, str] = {}
+    if args.format in ("markdown", "both"):
+        artifacts["md"] = render_markdown(review, excluded_note)
+    if args.format in ("json", "both"):
+        artifacts["json"] = _to_json(review) + "\n"
+    return artifacts
+
+
+def _write(args, artifacts: dict[str, str]) -> None:
+    """Write to `--output` or stdout.
+
+    `--format both` needs two destinations, and CI wants both as named artifacts (§18), so
+    the JSON takes the output path with a `.json` suffix. Without `--output` both go to
+    stdout in a fixed order — Markdown first, since that is the one a human is reading.
+    """
+    if not args.output:
+        print("\n".join(artifacts[key].rstrip() for key in ("md", "json") if key in artifacts))
+        return
+
+    path = Path(args.output)
+    if "md" in artifacts:
+        path.write_text(artifacts["md"])
+    if "json" in artifacts:
+        json_path = path if "md" not in artifacts else path.with_suffix(".json")
+        json_path.write_text(artifacts["json"])
+
+
 def _emit(args, review: Review) -> None:
-    text = json.dumps(review.public_dict(), indent=2, sort_keys=True, ensure_ascii=False)
-    if args.output:
-        Path(args.output).write_text(text + "\n")
-    else:
-        print(text)
+    """Render and write in one step, for the paths that return before the full pipeline."""
+    _write(args, _render(args, review))
+
+
+# --------------------------------------------------------------------------------------
+# Timing
+# --------------------------------------------------------------------------------------
+
+
+class Timings:
+    """Wall-clock time per pipeline stage, reported under `--verbose` (§14).
+
+    Deliberately wall-clock rather than CPU time: the number that matters to a reviewer
+    waiting on a run is how long the API calls took, and those are almost entirely spent
+    blocked on the network. Insertion order is preserved so the report reads as the
+    pipeline order, which is what makes an outlier stage obvious at a glance.
+    """
+
+    def __init__(self) -> None:
+        self._elapsed: dict[str, float] = {}
+
+    @contextmanager
+    def __call__(self, stage: str):
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            # Accumulate: a stage entered more than once reports its total, not its last.
+            self._elapsed[stage] = self._elapsed.get(stage, 0.0) + time.perf_counter() - start
+
+    @property
+    def total(self) -> float:
+        return sum(self._elapsed.values())
+
+    def report(self) -> str:
+        """`timings: parse 1.2ms · mask 8.4ms · … · total 2.31s`."""
+        if not self._elapsed:
+            return "timings: (none recorded)"
+        stages = " · ".join(f"{name} {_duration(s)}" for name, s in self._elapsed.items())
+        return f"timings: {stages} · total {_duration(self.total)}"
+
+
+def _duration(seconds: float) -> str:
+    return f"{seconds * 1000:.1f}ms" if seconds < 1 else f"{seconds:.2f}s"
 
 
 if __name__ == "__main__":  # pragma: no cover

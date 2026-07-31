@@ -1,0 +1,44 @@
+# Lint and unit tests on every PR (SPEC.md §18).
+#
+# No ANTHROPIC_API_KEY is provided here, deliberately. The suite never touches the network
+# (§17), and withholding the key is what enforces that: a test that grew a real call would
+# fail in CI rather than quietly start billing. Live calls are `make smoke`, run by hand.
+
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest -q
+
+      # Builds and prices every prompt without sending one (§9). It exercises the whole
+      # pipeline up to the network boundary against a real sample diff, which is the part
+      # a mocked suite cannot check — and it stays free.
+      - name: Dry run
+        run: review-bot sample_diffs/auth_bypass.diff --dry-run

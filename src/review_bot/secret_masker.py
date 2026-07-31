@@ -30,6 +30,7 @@ operator goes.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import tempfile
@@ -143,20 +144,29 @@ def mask_diff(diff: ParsedDiff) -> MaskResult:
     """
     findings: list[Finding] = []
     masked = 0
-    for parsed_file in diff.files:
-        file_findings, file_masked = _mask_file(parsed_file)
-        findings.extend(file_findings)
-        masked += file_masked
+
+    # Both context managers are entered once per *diff*, not once per file. Entering
+    # `transient_settings` rebuilds every plugin object and busts detect-secrets' internal
+    # caches, which profiles at roughly half of this stage's cost — paying that 40 times on
+    # a 40-file diff is pure waste, since the settings are identical every time. Scoping is
+    # unchanged: the block still closes before `mask_diff` returns, so no global state
+    # leaks out of the stage.
+    with transient_settings({"plugins_used": _PLUGINS}), tempfile.TemporaryDirectory() as tmpdir:
+        for parsed_file in diff.files:
+            file_findings, file_masked = _mask_file(parsed_file, tmpdir)
+            findings.extend(file_findings)
+            masked += file_masked
+
     findings.sort(key=lambda f: f.sort_key())
     return MaskResult(findings=findings, masked_line_count=masked)
 
 
-def _mask_file(parsed_file: ParsedFile) -> tuple[list[Finding], int]:
+def _mask_file(parsed_file: ParsedFile, tmpdir: str) -> tuple[list[Finding], int]:
     added = parsed_file.added_lines
     if parsed_file.is_binary or not added:
         return [], 0
 
-    hits = _scan(parsed_file.path, [ln.content for ln in added])
+    hits = _scan(parsed_file.path, [ln.content for ln in added], tmpdir)
     signal = path_signal(parsed_file.path)
 
     findings: list[Finding] = []
@@ -168,23 +178,26 @@ def _mask_file(parsed_file: ParsedFile) -> tuple[list[Finding], int]:
     return findings, len(hits)
 
 
-def _scan(path: str, contents: list[str]) -> dict[int, str]:
+def _scan(path: str, contents: list[str], tmpdir: str) -> dict[int, str]:
     """Scan added-line contents; return `{index into contents: winning detector type}`.
 
     detect-secrets reports 1-based line numbers against the temp file, which map straight
-    back onto `contents` by index.
+    back onto `contents` by index. `tmpdir` and the plugin settings are owned by
+    `mask_diff`, which enters both once for the whole diff.
     """
     if not contents:
         return {}
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Keep the original basename so extension-driven filters behave as they would on
-        # the real file.
-        scan_path = os.path.join(tmpdir, os.path.basename(path) or "snippet.txt")
-        with open(scan_path, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(contents) + "\n")
-        with transient_settings({"plugins_used": _PLUGINS}):
-            potential = list(scan.scan_file(scan_path))
+    # Keep the original basename so extension-driven filters behave as they would on the
+    # real file, but nest it under a digest of the full path: `mask_diff` now shares one
+    # temp directory across every file, and `src/a/config.py` and `src/b/config.py` would
+    # otherwise overwrite each other's scan input.
+    scan_dir = os.path.join(tmpdir, hashlib.sha256(path.encode()).hexdigest()[:16])
+    os.mkdir(scan_dir)
+    scan_path = os.path.join(scan_dir, os.path.basename(path) or "snippet.txt")
+    with open(scan_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(contents) + "\n")
+    potential = list(scan.scan_file(scan_path))
 
     best: dict[int, str] = {}
     for secret in potential:
@@ -246,6 +259,15 @@ def _mask_bare_token(content: str, placeholder: str) -> str:
     return f"{indent}{placeholder}"
 
 
+def _article(word: str) -> str:
+    """"A"/"An" for the detector name that opens the risk sentence.
+
+    The detector names are a fixed, known set (`_PLACEHOLDER_BY_TYPE`), so the vowel test is
+    sufficient — no name in it starts with a silent or consonant-sounding vowel.
+    """
+    return "An" if word[:1].upper() in "AEIOU" else "A"
+
+
 def _assigned_name(content: str) -> str | None:
     match = _ASSIGNMENT_RE.search(content)
     return match.group(1) if match else None
@@ -264,9 +286,9 @@ def _finding(path: str, line: DiffLine, secret_type: str, placeholder: str, sign
         confidence=_CONFIDENCE_BY_TYPE.get(secret_type, "medium"),
         evidence=f"`{name}` assigned a literal value at {where} (masked as {placeholder})",
         risk=(
-            f"A {secret_type} literal was added under a {signal} path. Anything committed to "
-            "history should be treated as disclosed to everyone with repository access, "
-            "including via forks and clones."
+            f"{_article(secret_type)} {secret_type} literal was added under a {signal} path. "
+            "Anything committed to history should be treated as disclosed to everyone with "
+            "repository access, including via forks and clones."
         ),
         recommendation=(
             "Move the value to an environment variable or secret store, and rotate the "

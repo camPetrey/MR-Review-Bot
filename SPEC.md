@@ -302,6 +302,10 @@ Rejected: feeding deterministic hits to the LLM as hints. Three reasons — it a
 - Each finding shows: line, category, severity, confidence, evidence, risk, recommendation.
 - **Masked values render as their placeholders.** Raw secret values must never appear in output. This is asserted in tests.
 
+**[AMENDED M5] The skipped-file note is passed to the renderer, not carried on `Review`.** §10 fixes the output schema exactly as the brief specifies, and a count of excluded files is presentation rather than a finding — adding a field for it would change the schema, which CLAUDE.md says to ask about first. `render_markdown(review, excluded_note)` takes it as a second argument, sourced from `FilterResult.exclusion_summary()`. The JSON is unchanged, and the note still reaches the reviewer in the header where §13 wants it.
+
+**[NEW M5] The renderer adds no judgment.** It does not filter, cap, re-score, or re-order anything `schema.py` settled; `overall_risk` renders as given rather than being recomputed from the findings present. Asserted in `test_renderer.py::test_overall_risk_is_taken_from_the_review_not_recomputed`. This is what makes "the JSON is the source of truth" true rather than aspirational: two artifacts that could disagree would mean neither is authoritative.
+
 ---
 
 ## 14. CLI
@@ -406,6 +410,12 @@ Output goes to the job log and is uploaded as a build artifact (`review.md`, `re
 
 `ANTHROPIC_API_KEY` from repository secrets. `review.yml` is `continue-on-error: true` so a bot failure never blocks the pipeline.
 
+**[AMENDED M5] `review.yml` triggers on `pull_request`, never `pull_request_target`.** This is a security decision, not a default. §3 treats the diff as attacker-controlled, and on a fork PR the same author also controls the workflow file — `pull_request_target` would run that workflow with repository secrets in scope, which is the standard way `ANTHROPIC_API_KEY` gets exfiltrated by a drive-by pull request. `pull_request` withholds secrets from fork PRs instead.
+
+The consequence is that fork PRs have no API key. Rather than fail the job, the workflow drops to `--no-llm`: §12 already guarantees deterministic findings without a network call, so a partial review is strictly better than none, and the output states that coverage was partial. Verified locally with the key unset.
+
+**[NEW M5] `test.yml` runs `--dry-run` after the test suite.** It exercises the whole pipeline up to the network boundary against a real sample diff — the one thing a fully mocked suite cannot check — and costs nothing. No API key is present in `test.yml` at all, deliberately: withholding it is what *enforces* §17's "unit tests never touch the network", since a test that grew a real call would fail in CI rather than quietly start billing.
+
 ---
 
 ## 19. Milestones
@@ -425,14 +435,14 @@ Output goes to the job log and is uploaded as a build artifact (`review.md`, `re
 
 ## 20. Definition of done
 
-- [ ] A new developer can clone, install, and run from the README end to end
-- [ ] Findings include file, line, category, severity, confidence, evidence, risk, recommendation, and a PR-ready comment
-- [ ] Secrets are masked before the LLM step; raw values never appear in output (asserted in tests)
-- [ ] No finding renders a line number absent from the diff
-- [ ] Automated tests pass in CI
-- [ ] Demo shows how the tool fits the PR review workflow
-- [ ] Known limitations documented honestly
-- [ ] Total API spend under $20
+- [x] A new developer can clone, install, and run from the README end to end — **M5**
+- [x] Findings include file, line, category, severity, confidence, evidence, risk, recommendation, and a PR-ready comment — **M5**, `test_renderer.py::test_every_required_field_renders`
+- [x] Secrets are masked before the LLM step; raw values never appear in output (asserted in tests) — `test_cli.py::test_raw_secrets_never_appear_in_output`, `test_masking_happens_before_the_prompt_is_built`
+- [x] No finding renders a line number absent from the diff — `test_cli.py::test_no_line_number_renders_that_is_not_in_the_diff`
+- [x] Automated tests pass in CI — **M5**, `test.yml`
+- [ ] Demo shows how the tool fits the PR review workflow — **M6**
+- [x] Known limitations documented honestly — README §Known limitations, all nine from §21
+- [ ] Total API spend under $20 — on track; no live call has been made yet beyond M1
 
 ---
 
@@ -456,4 +466,8 @@ Output goes to the job log and is uploaded as a build artifact (`review.md`, `re
 - Whether the summary pass on Haiku is good enough, or needs to move to Sonnet — **still open**, and now blocked on one live run rather than on implementation. Both call paths are built and mocked end to end; the decision needs `make smoke` output, which is deliberately manual.
 - Optional M4 experiment: run all 5 sample diffs through `claude-opus-5` at medium once (~$0.50) and diff the findings against Sonnet's. If Opus consistently catches something Sonnet misses, revisit the model choice; if not, the decision is settled for fifty cents. **Still open** — `--model` makes it a one-line experiment.
 - **[NEW M4] Structured outputs (`output_config.format`) for the two calls.** The API can constrain responses to a JSON schema, which would make the exit-2 path nearly unreachable. Deliberately *not* adopted without a decision, because §15's "malformed JSON → print raw, exit 2, no auto-repair" is a stated contract, and constraining generation changes what that contract is protecting against. It is a genuine improvement, not a repair step, so it is worth deciding on rather than assuming. Blocked on: does making a documented failure mode unreachable count as changing the schema, which §22 and CLAUDE.md say to ask about first?
+- **[NEW M5] Performance.** The deterministic stages now cost ~1ms per file and scale linearly to 100 files (`make bench`). The one real inefficiency found was in `secret_masker`: `transient_settings` was entered once per *file*, and entering it rebuilds every detect-secrets plugin and busts their caches — roughly half the stage's cost. Hoisting it to once per diff halved the stage on multi-file input. Guarded by `test_secret_masker.py::test_plugin_settings_are_configured_once_per_diff`, which asserts the call count rather than a wall-clock threshold, because a timing assertion on a shared CI runner is a flaky test. **Nothing further is worth optimizing:** a real run is dominated by two network calls, and the whole deterministic pipeline over a 100-file diff costs less than a tenth of one of them.
+
+- **[NEW M5] `test_diff_parser.py` was empty.** M2 shipped the parser and its test *diffs* but not the test file, so §17's first per-module requirement was unmet and the gap was invisible because the suite was green. Now written — 30 cases, including the added-line numbering that §11 depends on. **The lesson worth keeping: a green suite is not evidence of coverage when the missing tests are missing files.** No further empty test modules remain.
+
 - **[NEW M4] `thinking` configuration for the review pass.** The call currently leaves adaptive thinking at the model default. Thinking tokens bill as output and count against `max_tokens`, so this is a live cost and truncation variable that no local test can measure. Tune with the first `make smoke` figures, alongside the §19 M1 instruction to correct the budget model from real `usage`.

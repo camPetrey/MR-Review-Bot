@@ -1,10 +1,16 @@
-.PHONY: test lint dry-run smoke record
+.PHONY: test lint bench dry-run smoke record
 
 test:
 	pytest
 
 lint:
 	ruff check .
+
+# Times the deterministic stages against synthetic diffs of growing size. No network.
+# Watch the per-file column: flat is correct, rising means a stage is paying fixed setup
+# cost once per file instead of once per run.
+bench:
+	python scripts/bench.py
 
 # No network. Builds and prices every prompt, sends nothing (SPEC.md §9).
 # Safe to run anywhere, including CI.

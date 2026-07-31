@@ -8,3 +8,4 @@ venv/
 .env
 review.md
 review.json
+.review_bot_cache/
