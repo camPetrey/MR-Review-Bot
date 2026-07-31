@@ -74,10 +74,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "diff",
         metavar="DIFF_PATH",
-        help="Path to a unified diff, or '-' to read stdin. No git invocation (§14).",
+        help="Path to a unified diff, or '-' to read stdin. No git invocation.",
     )
     parser.add_argument("--format", choices=["markdown", "json", "both"], default="markdown",
-                        help="Output format (§14). JSON is the source of truth either way.")
+                        help="Output format. JSON is the source of truth either way.")
     parser.add_argument("--output", metavar="PATH",
                         help="Write output to a file (default stdout). With --format both, "
                              "Markdown goes to PATH and JSON to PATH with a .json suffix.")
@@ -85,14 +85,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--summary-model", default=DEFAULT_SUMMARY_MODEL)
     parser.add_argument("--effort", choices=["low", "medium", "high"], default="medium")
     parser.add_argument("--fail-on", choices=["none", "high"], default="none",
-                        help="Exit 4 when findings reach this severity. Off by default (§15).")
+                        help="Exit 4 when findings reach this severity. Off by default.")
     parser.add_argument("--cache", action="store_true",
-                        help="Reuse cached responses by prompt hash. Off by default (§14).")
+                        help="Reuse cached responses by prompt hash. Off by default.")
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--record", metavar="DIR", type=Path,
-                        help="Write raw responses to DIR as test fixtures (§17)")
+                        help="Write raw responses to DIR as test fixtures")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Build and price the prompts, send nothing (§9)")
+                        help="Build and price the prompts, send nothing")
     parser.add_argument("--no-llm", action="store_true", help="Deterministic findings only")
     parser.add_argument("--max-input-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS)
     parser.add_argument("--max-run-cost", type=float, default=0.50)

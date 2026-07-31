@@ -34,12 +34,12 @@ pattern match — the finding requires reading what the branch actually does, wh
 half of the review the deterministic rules cannot do."
 
 NOTE_secrets_and_logging="A credential and a logging change. The deterministic layer owns
-both (§5, §6): they are found without a network call, and the secret is masked before the
-prompt is built, so no raw value can reach the API or the output below."
+both: they are found without a network call, and the secret is masked before the prompt is
+built, so no raw value can reach the API or the output below."
 
-NOTE_clean_but_suspicious="Code that reads alarming and is fine. This is the canary from
-§17 — a reviewer who is paged for this stops reading the reviewer, so a quiet result here
-is a feature under test, not a boring case."
+NOTE_clean_but_suspicious="Code that reads alarming and is fine. This is the false-positive
+canary — a reviewer who is paged for this stops reading the reviewer, so a quiet result
+here is a feature under test, not a boring case."
 
 rule() { printf '%s\n' "────────────────────────────────────────────────────────────────────────"; }
 
@@ -113,8 +113,8 @@ cat <<'OUTRO'
 
     git diff origin/main...HEAD | review-bot - --format both --output review.md
 
-  That is the same command `.github/workflows/review.yml` runs on every pull request
-  (§18). The job is advisory: it uploads review.md and review.json as build artifacts
+  That is the same command `.github/workflows/review.yml` runs on every pull request.
+  The job is advisory: it uploads review.md and review.json as build artifacts
   and writes the Markdown to the job summary. It never posts a comment and never blocks
   a merge — the exit code says whether the *tool* worked, not how bad the findings were.
 
