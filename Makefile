@@ -1,4 +1,4 @@
-.PHONY: test lint bench dry-run smoke record
+.PHONY: test lint bench dry-run demo smoke record record-cache
 
 test:
 	pytest
@@ -28,3 +28,17 @@ smoke:
 # contract test validates against.
 record:
 	review-bot sample_diffs/auth_bypass.diff --record tests/fixtures --verbose
+
+# The M6 demo (§19). Replays the committed response cache over three sample diffs.
+# No key, no network, no spend — safe to run anywhere, including on a fresh clone.
+demo:
+	bash scripts/demo.sh
+
+# Rebuild the demo's response cache from live responses. Manual only, like `smoke`.
+# One call pair per sample diff. Needs ANTHROPIC_API_KEY. Kept separate from `record`
+# because that target owns the test fixtures and this one owns the demo (§17, §19).
+record-cache:
+	@for d in sample_diffs/*.diff; do \
+		echo "== $$d"; \
+		review-bot "$$d" --cache --verbose >/dev/null || exit 1; \
+	done

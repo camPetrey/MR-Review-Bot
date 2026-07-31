@@ -48,7 +48,9 @@ review-bot changes.diff --dry-run
 | `--model ID` | `claude-sonnet-5` | Override the review model |
 | `--effort {low,medium,high}` | `medium` | Effort level |
 | `--fail-on {none,high}` | `none` | Exit 4 on findings at/above this severity |
+| `--summary-model ID` | `claude-haiku-4-5-20251001` | Override the summary model |
 | `--cache` | off | Reuse responses by prompt hash |
+| `--cache-dir PATH` | `.review_bot_cache` | Where `--cache` reads and writes |
 | `--record DIR` | off | Overwrite test fixtures from live responses |
 | `--dry-run` | off | Build the prompts, price them, send nothing |
 | `--no-llm` | off | Deterministic findings only |
@@ -65,6 +67,42 @@ review-bot changes.diff --dry-run
 | `2` | The model returned malformed JSON. The raw response is printed verbatim; there is no auto-repair and no retry. |
 | `3` | A budget guard aborted the run |
 | `4` | Findings met `--fail-on` (only reachable when the flag is set) |
+
+## Demo
+
+```
+make demo
+```
+
+Runs the reviewer over three sample diffs and prints what a reviewer would see on the PR.
+**No API key, no network call, no cost** — every response is replayed from the committed
+response cache (`.review_bot_cache/`), which is why this works on a fresh clone before
+anything is configured. Prompts are byte-stable, so the same diffs replay the same review.
+
+The three diffs are the whole argument for the tool in order:
+
+| Diff | What it demonstrates |
+|---|---|
+| `auth_bypass.diff` | A permission check removed behind a query parameter — a logic flaw that has to be *read*, not matched. This is the half of the review the deterministic rules cannot do. |
+| `secrets_and_logging.diff` | The deterministic layer: found with no network call, and the credential masked **before** the prompt exists, so no raw value can reach the API or the output. |
+| `clean_but_suspicious.diff` | Code that reads alarming and is fine. The false-positive canary — a reviewer who gets paged for this stops reading the reviewer at all. |
+
+The demo aborts rather than run cold: a missing cache entry would silently degrade to
+deterministic-only findings, which is correct behaviour for the tool and a dishonest demo.
+Rebuild the cache with `make record-cache` (needs a key) after changing a prompt or a
+sample diff.
+
+### Where it sits in the review workflow
+
+```bash
+git diff origin/main...HEAD | review-bot - --format both --output review.md
+```
+
+That is the same command `.github/workflows/review.yml` runs on every pull request. The job
+uploads `review.md` and `review.json` as build artifacts and writes the Markdown to the job
+summary. It is `continue-on-error`: it never posts a comment and never blocks a merge. Fork
+PRs get no API key and fall back to `--no-llm` rather than failing — partial coverage,
+stated as partial, beats no review.
 
 ## How it works
 
@@ -95,7 +133,10 @@ make test      # pytest, never touches the network
 make lint      # ruff
 make bench     # time the deterministic stages against synthetic diffs
 make dry-run   # build and price every prompt, send nothing
+make demo      # replay the recorded cache over 3 sample diffs. No key, no cost.
 make smoke     # ONE real API call pair. Manual only, never in CI.
+make record    # overwrite tests/fixtures/ from live responses
+make record-cache  # rebuild the demo cache from live responses
 ```
 
 CI runs lint, tests and a dry run on every PR (`test.yml`), and runs the bot against the
@@ -131,6 +172,22 @@ These are real boundaries, not bugs to be filed.
 ## Cost
 
 `claude-sonnet-5` is priced at $2/$10 per MTok through **2026-08-31**; standard $3/$15
-pricing resumes 2026-09-01. The model ID is pinned. Budget guards abort a run that would
-exceed `--max-input-tokens` per call or `--max-run-cost` per run, and `--dry-run` prices a
-run without sending it.
+pricing resumes 2026-09-01. `claude-haiku-4-5-20251001` handles the summary pass at $1/$5.
+Both model IDs are pinned.
+
+Measured across all five sample diffs (two calls each):
+
+| | Per run | All five |
+|---|---|---|
+| `--dry-run` estimate | $0.094 | $0.47 |
+| Actual | $0.004 – $0.013 | **$0.035** |
+
+The estimate is 7–25× high **by design**: `--max-run-cost` is checked *before* the request,
+where the real output length is unknowable, so a call is priced at its full `max_tokens`. A
+guard that can under-estimate is not a guard. The consequence to know about is that the
+budget is spent in *estimated* dollars — the default `--max-run-cost 0.50` trips after
+roughly ten review calls, so a diff large enough to pack into that many batches can abort a
+run that would have cost pennies. Raise `--max-run-cost` when that happens.
+
+Prompt caching cuts the review call's input further: the system prompt is byte-stable, so it
+is written once per session and read on every subsequent call.

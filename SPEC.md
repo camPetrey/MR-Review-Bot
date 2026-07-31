@@ -323,14 +323,21 @@ review-bot [DIFF_PATH | -] [options]
 | `--model ID` | `claude-sonnet-5` | Override review model |
 | `--effort {low,medium,high}` | `medium` | Effort level |
 | `--fail-on {none,high}` | `none` | Exit non-zero on findings at/above severity |
+| `--summary-model ID` | `claude-haiku-4-5-20251001` | Override summary model |
 | `--cache` | off | Cache by diff hash; makes the M6 demo network-independent |
+| `--cache-dir PATH` | `.review_bot_cache` | Where `--cache` reads and writes |
 | `--record` | off | Overwrite test fixtures from live responses |
 | `--dry-run` | off | Build prompt, price it, send nothing |
 | `--no-llm` | off | Deterministic findings only |
 | `--max-input-tokens N` | 8000 | Per-call budget guard |
+| `--max-run-cost N` | 0.50 | Per-run budget guard, in dollars |
 | `--verbose` | off | Per-call usage and timing to stderr |
 
 `--cache` is deliberately **off by default** — a second run should be allowed to produce a better review. Its one justified use is M6's requirement that the demo run unattended: a cached run does not depend on the network, the API budget, or the model having a bad morning.
+
+**[AMENDED M6] The cache key is the prompt bytes, not the diff hash, and the demo cache is committed.** Keying on the prompt is the diff hash refined: the prompt is a pure function of the diff, and keying on it also separates the two calls of §8 and each batch of §7, and invalidates when `--model` or `--effort` changes — all of which a diff hash would collide. `.review_bot_cache/` is checked in rather than ignored, because "runs unattended" in §19 means *on a fresh clone with no key configured*; a cache the demo has to build first is a cache the demo does not have.
+
+**[NEW M6] The demo aborts on a cache miss rather than degrading.** §12 keeps deterministic findings alive when a call fails, so a cold-cache demo would still exit 0 and still print a review — a *partial* review, presented as the full one. That is right for the tool and wrong for a demo, so `scripts/demo.sh` greps the `--verbose` log for cache hits and fails loudly instead. The distinction worth keeping: graceful degradation is a property of the tool, not of everything built on it.
 
 ---
 
@@ -414,6 +421,10 @@ Output goes to the job log and is uploaded as a build artifact (`review.md`, `re
 
 The consequence is that fork PRs have no API key. Rather than fail the job, the workflow drops to `--no-llm`: §12 already guarantees deterministic findings without a network call, so a partial review is strictly better than none, and the output states that coverage was partial. Verified locally with the key unset.
 
+**[NEW M6] Both workflow files were committed empty in M1 and stayed empty until M5.** `review.yml` and `test.yml` existed as zero-byte placeholders in every commit from the initial one through M4. GitHub cannot parse an empty workflow, so every push to every branch produced an *invalid workflow file* startup failure — a run with no jobs, no logs, and a failure email. Twenty consecutive failed runs, none of which had anything to do with the code. `main` still carries the empty files, because M5 is the first commit with real ones and it has not merged yet; this milestone's merge is what fixes it.
+
+Two things worth keeping from it. **A CI failure with zero jobs is a parse failure, not a test failure** — the run's `name` showing as the file path instead of the workflow's `name:` is the tell, and no amount of reading the code would have found it. And **`continue-on-error` is why the noise was one workflow's worth and not two**: `review.yml`'s job-level `continue-on-error: true` means a genuine bot failure resolves the run as success and sends no mail, so once the files parse, the only workflow that can page anyone is `test.yml` — which is exactly the one that should.
+
 **[NEW M5] `test.yml` runs `--dry-run` after the test suite.** It exercises the whole pipeline up to the network boundary against a real sample diff — the one thing a fully mocked suite cannot check — and costs nothing. No API key is present in `test.yml` at all, deliberately: withholding it is what *enforces* §17's "unit tests never touch the network", since a test that grew a real call would fail in CI rather than quietly start billing.
 
 ---
@@ -440,9 +451,9 @@ The consequence is that fork PRs have no API key. Rather than fail the job, the 
 - [x] Secrets are masked before the LLM step; raw values never appear in output (asserted in tests) — `test_cli.py::test_raw_secrets_never_appear_in_output`, `test_masking_happens_before_the_prompt_is_built`
 - [x] No finding renders a line number absent from the diff — `test_cli.py::test_no_line_number_renders_that_is_not_in_the_diff`
 - [x] Automated tests pass in CI — **M5**, `test.yml`
-- [ ] Demo shows how the tool fits the PR review workflow — **M6**
+- [x] Demo shows how the tool fits the PR review workflow — **M6**, `make demo` / README §Demo
 - [x] Known limitations documented honestly — README §Known limitations, all nine from §21
-- [ ] Total API spend under $20 — on track; no live call has been made yet beyond M1
+- [x] Total API spend under $20 — **M6**, $0.035 across all five sample diffs (ten calls). The budget guards were never the binding constraint; see §22.
 
 ---
 
@@ -463,11 +474,43 @@ The consequence is that fork PRs have no API key. Rather than fail the job, the 
 ## 22. Open items
 
 - ~~Exact token budget for packing~~ — **[RESOLVED M4]** 8,000 stands as the default. All five sample diffs pack into a single call well under it (the largest estimates ~1.3k input tokens including the system prompt), so the splitting path is exercised by tests rather than by the samples. There is no evidence to tune against until a large real diff appears; `--max-input-tokens` remains the escape hatch.
-- Whether the summary pass on Haiku is good enough, or needs to move to Sonnet — **still open**, and now blocked on one live run rather than on implementation. Both call paths are built and mocked end to end; the decision needs `make smoke` output, which is deliberately manual.
+- ~~Whether the summary pass on Haiku is good enough, or needs to move to Sonnet~~ — **[RESOLVED M6]** Haiku stays. See the resolved entry below for the evidence.
 - Optional M4 experiment: run all 5 sample diffs through `claude-opus-5` at medium once (~$0.50) and diff the findings against Sonnet's. If Opus consistently catches something Sonnet misses, revisit the model choice; if not, the decision is settled for fifty cents. **Still open** — `--model` makes it a one-line experiment.
 - **[NEW M4] Structured outputs (`output_config.format`) for the two calls.** The API can constrain responses to a JSON schema, which would make the exit-2 path nearly unreachable. Deliberately *not* adopted without a decision, because §15's "malformed JSON → print raw, exit 2, no auto-repair" is a stated contract, and constraining generation changes what that contract is protecting against. It is a genuine improvement, not a repair step, so it is worth deciding on rather than assuming. Blocked on: does making a documented failure mode unreachable count as changing the schema, which §22 and CLAUDE.md say to ask about first?
 - **[NEW M5] Performance.** The deterministic stages now cost ~1ms per file and scale linearly to 100 files (`make bench`). The one real inefficiency found was in `secret_masker`: `transient_settings` was entered once per *file*, and entering it rebuilds every detect-secrets plugin and busts their caches — roughly half the stage's cost. Hoisting it to once per diff halved the stage on multi-file input. Guarded by `test_secret_masker.py::test_plugin_settings_are_configured_once_per_diff`, which asserts the call count rather than a wall-clock threshold, because a timing assertion on a shared CI runner is a flaky test. **Nothing further is worth optimizing:** a real run is dominated by two network calls, and the whole deterministic pipeline over a 100-file diff costs less than a tenth of one of them.
 
+- **[NEW M6] The release tag from §19 is deliberately not cut.** A tag should point at merged `main`, and `main` does not yet contain M5 or M6 — it is still carrying the empty workflow files described in §18. Tag once this milestone merges; versioning is otherwise unowned by this spec.
+
+- **[RESOLVED M6] The budget model is correct but wildly conservative, and that is now a measured number.** §9 prices a call at its *full* `max_tokens`, so `--dry-run` quotes ~$0.0945 per sample diff. Across all five, real runs cost **$0.0037–$0.0131**, total **$0.035** — the estimate overshoots by 7–25×, because review responses used 104–424 output tokens against a 8,000-token ceiling and summaries 97–360 against 2,000.
+
+  **The worst-case model stays.** A guard that can under-estimate cannot guard: `preflight` runs *before* the request, where the real output length is unknowable, and the only safe assumption is the ceiling. But the overshoot has a consequence worth stating, because it is not obvious from the code: `--max-run-cost` is spent in *estimated* dollars, so the default $0.50 trips after ~10 review calls even though ten real calls would cost well under a dollar. On a diff large enough to pack into that many batches (§7), the guard fires on a run that was never going to be expensive. `--max-run-cost` is the documented escape hatch; the number to raise it to is now knowable rather than guessed.
+
+- **[RESOLVED M6] Prompt caching works on call 1 and is inert on call 2.** The review system prompt cached exactly as §8 predicted — 2,065 tokens written on the first call of the session and **read on all four subsequent ones**, across different diffs. That is the byte-stability claim confirmed empirically rather than argued: had any of the "no timestamps, no UUIDs, sorted lists" rules leaked, the reads would have been zero.
+
+  The summary call reports `cache_read=0 cache_write=0` every time. Its system prompt is a module constant like the other, but it is **below the minimum cacheable prefix** for `claude-haiku-4-5-20251001`, so the `cache_control` block on it does nothing. Harmless — it costs neither tokens nor correctness — but it is dead configuration, and worth knowing before someone reads a zero as a bug.
+
+- **[RESOLVED M6] Haiku is good enough for the summary pass.** The open question below asked for one live run. On all five diffs the summaries were accurate and specific rather than generic — the `auth_bypass` summary names both changed files, both removed checks, and the newly added route, and correctly connects them into one privilege-escalation window. Call 2 never sees the diff (§8); it summarises validated findings, which is a task Haiku does well. **No reason to move it to Sonnet.** Revisit only if summaries start contradicting the findings they summarise.
+
+- **[NEW M6] §11's counters came back zero on live data.** `unmappable_count=0` and `hallucinated_file_count=0` on all five diffs. M4's acceptance criterion was "driven toward zero" and it is there — but note what this does *not* prove: five hand-written 30-line diffs are the easy case for line mapping. The counters exist because the hard case is a real PR, and §18 puts them in the CI job output for exactly that reason.
+
+- **[NEW M6] The confidence merge of §12 is visible in the live `auth_bypass` review.** Three findings, three different confidences, each earned a different way: the removed `is_admin` check came back **high** (both layers found it), the removed `@login_required` **low** (deterministic only — the rule sees a decorator disappear and cannot tell whether it moved), and the new `admin_raw` route **medium** (LLM only, no rule for it). That spread is the whole design working end to end, and it is the strongest single piece of evidence M6 produced.
+
+- **[NEW M6] The two models frame their JSON differently, and the fixtures now prove the parser handles it.** Sonnet returns bare JSON on the review call; Haiku wraps the summary in a ```` ```json ```` fence. `_strip_code_fence` already handled this and §15 already justified it as a *framing* fix rather than an auto-repair — but until M6 the only fenced input the suite had ever seen was one a test wrote for itself. `tests/fixtures/summary-auth_bypass.json` is now a real fenced Haiku response, so the highest-value test in the suite validates that path against something the API actually sent. **This also closes the M5 loop below:** `--record` wrote exactly the two fixture names the contract test reads, which is the `_record_stem` fix demonstrated rather than asserted.
+
+- **[NEW M6] `clean_but_suspicious.diff` produced zero findings on a live run, not just zero Tier 1 hits.** §17 only asks the canary to stay quiet through the deterministic layer. It also stayed quiet through the model, which is the harder half — the file is written to look alarming. One run is not a false-positive rate, but it is the right sign.
+
+- **[NEW M5] `--record` never overwrote the fixtures it claimed to.** The call labels were
+  `review-{batch index}` and `summary`, so `make record` wrote `review-0.json` and
+  `summary.json` while `tests/fixtures/` — keyed by sample diff — kept validating the
+  original `review-auth_bypass.json` and `summary-auth_bypass.json`. The contract test
+  stayed green throughout, because it validates whatever files are present and both sets
+  were valid. Labels are now derived from the diff filename (`_record_stem`), so the
+  written names match the fixture names exactly, and
+  `test_cli.py::test_record_writes_fixture_names_derived_from_the_diff` fails if they drift
+  apart again. **Same lesson as the empty test module below, one level further out: a green
+  contract test proves the fixtures are well-formed, not that they are the ones a live run
+  would produce.**
+
 - **[NEW M5] `test_diff_parser.py` was empty.** M2 shipped the parser and its test *diffs* but not the test file, so §17's first per-module requirement was unmet and the gap was invisible because the suite was green. Now written — 30 cases, including the added-line numbering that §11 depends on. **The lesson worth keeping: a green suite is not evidence of coverage when the missing tests are missing files.** No further empty test modules remain.
 
-- **[NEW M4] `thinking` configuration for the review pass.** The call currently leaves adaptive thinking at the model default. Thinking tokens bill as output and count against `max_tokens`, so this is a live cost and truncation variable that no local test can measure. Tune with the first `make smoke` figures, alongside the §19 M1 instruction to correct the budget model from real `usage`.
+- **[NEW M4, UPDATED M6] `thinking` configuration for the review pass.** The call leaves adaptive thinking at the model default. Thinking tokens bill as output and count against `max_tokens`, so this was flagged as a live cost and truncation risk. **M6's figures retire the truncation half of that worry and leave the tuning half open.** Review responses used 104–424 output tokens against an 8,000-token ceiling — thinking included, since `usage.output_tokens` does not break it out — so nothing came close to truncating and `REVIEW_MAX_TOKENS` needs no change. What is still unknown is how much of that was thinking, which is what an `effort` sweep would answer. Not worth doing against five easy diffs; do it when there is a large real diff to sweep against.
