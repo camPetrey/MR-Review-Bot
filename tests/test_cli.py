@@ -90,6 +90,16 @@ def test_unparseable_input_exits_1(capsys) -> None:
     assert "could not parse diff" in err
 
 
+def test_non_utf8_diff_exits_1(capsys, tmp_path) -> None:
+    """A diff file that is not UTF-8 is bad input (exit 1), not a traceback."""
+    diff = tmp_path / "latin1.diff"
+    diff.write_bytes("+password = 'caf\xe9'\n".encode("latin-1"))
+    code, _, err = run([str(diff)], capsys)
+
+    assert code == cli.EXIT_PARSE_ERROR
+    assert "could not read diff" in err
+
+
 def test_empty_diff_exits_0_without_calling_the_api(capsys, fake_llm) -> None:
     """§15 and invariant 6: never spend money on an empty diff."""
     sent = fake_llm(review_json(), summary_json())
@@ -315,6 +325,28 @@ def test_raw_secrets_never_appear_in_output(capsys, fake_llm) -> None:
     assert "[MASKED_" in out, "the placeholder is what renders instead (§13)"
 
 
+def test_removed_line_secret_never_reaches_prompt_or_output(capsys, fake_llm, tmp_path) -> None:
+    """Invariants 1 and 7 with no line-kind qualifier: a secret on a *removed* line is
+    quoted verbatim by the `auth_perms` rule's evidence, which flows into both the summary
+    prompt and the report — so the masker must have destroyed the value first."""
+    diff = tmp_path / "removed_secret.diff"
+    diff.write_text(
+        "diff --git a/src/app/views.py b/src/app/views.py\n"
+        "--- a/src/app/views.py\n+++ b/src/app/views.py\n"
+        "@@ -1,2 +1,2 @@\n def handler(request):\n"
+        '-    if request.user.is_admin and token == "ghp_16C7e42F292c6912E7710c838347Ae178B4a":\n'
+        "+    pass\n"
+    )
+    sent = fake_llm(review_json(), summary_json())
+    code, payload, _ = run([str(diff)], capsys)
+
+    assert code == cli.EXIT_OK
+    auth = [f for f in payload["findings"] if f["category"] == "auth_perms"]
+    assert auth, "the removed is_admin check is still reported"
+    for text in [json.dumps(payload), *sent]:
+        assert "16C7e42F292c6912E7710c838347Ae178B4a" not in text
+
+
 def test_masking_happens_before_the_prompt_is_built(capsys, fake_llm) -> None:
     """Invariant 1, asserted where it is enforceable: no raw diff content reaches the API."""
     sent = fake_llm(review_json(), summary_json())
@@ -361,6 +393,20 @@ def test_format_both_writes_markdown_and_json_side_by_side(capsys, fake_llm, tmp
     assert code == cli.EXIT_OK
     assert target.read_text().startswith("# Security review")
     assert json.loads((tmp_path / "review.json").read_text())["findings"]
+
+
+def test_format_both_with_json_output_path_keeps_both_artifacts(fake_llm, tmp_path) -> None:
+    """`--output report.json` with `--format both`: with_suffix would be a no-op there,
+    and the JSON write would silently clobber the Markdown written a line earlier."""
+    fake_llm(review_json(), summary_json())
+    target = tmp_path / "review.json"
+    code = cli.main(
+        [str(SAMPLE_DIFFS / "auth_bypass.diff"), "--format", "both", "--output", str(target)]
+    )
+
+    assert code == cli.EXIT_OK
+    assert target.read_text().startswith("# Security review"), "Markdown still goes to PATH"
+    assert json.loads((tmp_path / "review.json.json").read_text())["findings"]
 
 
 def test_format_both_to_stdout_emits_both(capsys, fake_llm) -> None:

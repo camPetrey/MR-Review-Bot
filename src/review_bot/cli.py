@@ -111,7 +111,9 @@ def main(argv: list[str] | None = None) -> int:
     except DiffParseError as exc:
         print(f"error: could not parse diff: {exc}", file=sys.stderr)
         return EXIT_PARSE_ERROR
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError: a diff file that is not UTF-8 (Latin-1 content is common in
+        # older repositories) is unreadable input, not a crash.
         print(f"error: could not read diff: {exc}", file=sys.stderr)
         return EXIT_PARSE_ERROR
 
@@ -406,7 +408,13 @@ def _write(args, artifacts: dict[str, str]) -> None:
     if "md" in artifacts:
         path.write_text(artifacts["md"])
     if "json" in artifacts:
-        json_path = path if "md" not in artifacts else path.with_suffix(".json")
+        json_path = path
+        if "md" in artifacts:
+            # When PATH already ends in .json, with_suffix is a no-op and the JSON would
+            # silently overwrite the Markdown just written — append instead.
+            json_path = path.with_suffix(".json")
+            if json_path == path:
+                json_path = path.with_name(path.name + ".json")
         json_path.write_text(artifacts["json"])
 
 

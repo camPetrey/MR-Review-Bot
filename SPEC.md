@@ -86,6 +86,18 @@ Runs before any network call, on the parsed diff.
 - Attach a path signal to each masked finding: `test` if the file path matches `tests/`, `test_*`, `conftest.py`, `fixtures/`, `*_test.*`; otherwise `src`.
 - Substitution is in-place within the line, preserving line numbers and diff alignment.
 
+**[AMENDED M6] Every line kind is masked; only added lines are reported.** Masking
+originally covered added lines alone, on the reasoning that a secret on a removed or
+context line was already in the repository. That reasoning is correct about *findings* and
+wrong about *masking*: removed and context lines are quoted downstream — both render into
+the review prompt, and the `auth_perms` rule quotes removed lines verbatim into evidence
+that reaches the summary prompt and the report. The invariants "no raw diff content
+reaches the API" and "raw secret values never appear in output" carry no line-kind
+qualifier, so the masker now scans and substitutes on all three kinds. `hardcoded_secrets`
+findings are still emitted for added lines only: a pre-existing secret is masked, not
+reported, because this PR did not introduce it. Asserted end to end in
+`test_cli.py::test_removed_line_secret_never_reaches_prompt_or_output`.
+
 **[DEVIATION]** The brief's prompting section names `[MASKED_KEY]` and `[MASKED_TOKEN]`. Typed placeholders are a superset, consistent with the brief's intent. Rationale: an untyped `[MASKED]` gives the model nothing to reason about and produces uniform high-severity findings on test fixtures. The type and path signal carry enough context for useful severity assignment without carrying the value.
 
 ### Resolving the masking / `hardcoded_secrets` tension

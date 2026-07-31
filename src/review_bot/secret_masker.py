@@ -116,10 +116,16 @@ def path_signal(path: str) -> str:
 
 
 def mask_diff(diff: ParsedDiff) -> MaskResult:
-    """Mask every added line in `diff` in place and return the `hardcoded_secrets` findings.
+    """Mask every line in `diff` in place and return the `hardcoded_secrets` findings.
 
-    Only added lines are scanned. A secret on a context or removed line was already in the
-    repository and is not something this PR introduced.
+    Every line kind is masked — added, removed, and context — because all three are quoted
+    downstream: added lines by the prompt and the rules' evidence, removed and context
+    lines by the prompt and the `auth_perms` rule. Invariants 1 and 7 are unconditional,
+    so no line kind may carry a raw value past this stage.
+
+    *Findings* are emitted for added lines only. A secret on a removed or context line was
+    already in the repository and is not something this PR introduced; it is masked, not
+    reported.
     """
     findings: list[Finding] = []
     masked = 0
@@ -141,19 +147,20 @@ def mask_diff(diff: ParsedDiff) -> MaskResult:
 
 
 def _mask_file(parsed_file: ParsedFile, tmpdir: str) -> tuple[list[Finding], int]:
-    added = parsed_file.added_lines
-    if parsed_file.is_binary or not added:
+    lines = [ln for hunk in parsed_file.hunks for ln in hunk.lines]
+    if parsed_file.is_binary or not lines:
         return [], 0
 
-    hits = _scan(parsed_file.path, [ln.content for ln in added], tmpdir)
+    hits = _scan(parsed_file.path, [ln.content for ln in lines], tmpdir)
     signal = path_signal(parsed_file.path)
 
     findings: list[Finding] = []
     for index, secret_type in sorted(hits.items()):
-        line = added[index]
+        line = lines[index]
         placeholder = _placeholder_for(secret_type, line.content)
         line.content = _mask_line(line.content, placeholder, secret_type)
-        findings.append(_finding(parsed_file.path, line, secret_type, placeholder, signal))
+        if line.is_added:
+            findings.append(_finding(parsed_file.path, line, secret_type, placeholder, signal))
     return findings, len(hits)
 
 
@@ -288,6 +295,6 @@ def _finding(path: str, line: DiffLine, secret_type: str, placeholder: str, sign
             "credential — the tool masks the value before review and so cannot confirm "
             "whether it is live."
         ),
-        source="deterministic",
-        rule_id=RULE_ID,
+        source = "deterministic", # type: ignore
+        rule_id = RULE_ID, # type: ignore
     )

@@ -137,15 +137,22 @@ def test_recommendation_always_mentions_rotation() -> None:
     assert "rotate" in result.findings[0].recommendation.lower()
 
 
-def test_only_added_lines_are_scanned() -> None:
-    """A secret on a removed line was already in the repo; this PR did not introduce it."""
+def test_removed_line_secret_is_masked_but_not_reported() -> None:
+    """A secret on a removed line was already in the repo, so this PR did not introduce it
+    and it earns no finding. It is still *masked*, because removed lines are quoted
+    downstream — in the prompt and in `auth_perms` evidence — and invariant 7 has no
+    added-lines-only qualifier."""
     diff = build_diff(
         "src/app/config.py",
         removed=['KEY = "AKIAIOSFODNN7EXAMPLE"'],
         added=["KEY = os.environ['K']"],
     )
     result = mask_diff(diff)
+
     assert result.findings == []
+    removed = diff.files[0].removed_lines[0].content
+    assert "AKIAIOSFODNN7EXAMPLE" not in removed
+    assert "[MASKED_" in removed
 
 
 def test_clean_but_suspicious_produces_no_secret_findings() -> None:
