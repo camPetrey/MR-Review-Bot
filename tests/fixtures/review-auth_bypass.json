@@ -1,0 +1,24 @@
+{
+  "findings": [
+    {
+      "file": "src/app/views/admin.py",
+      "line": 9,
+      "category": "auth_perms",
+      "severity": "high",
+      "confidence": "high",
+      "evidence": "The added block returns the admin dashboard whenever the `internal` query parameter is present: `if request.GET.get(\"internal\"):`",
+      "risk": "The branch is taken before any permission check runs, so any unauthenticated caller who appends `?internal=1` reaches the admin dashboard. A query parameter is fully attacker-controlled and is not a trust boundary.",
+      "recommendation": "Move the permission check above the fast path, or gate the branch on an authenticated session attribute rather than a request parameter. If this is meant for internal traffic, enforce it at the network layer, not in the query string."
+    },
+    {
+      "file": "src/app/urls.py",
+      "line": 33,
+      "category": "auth_perms",
+      "severity": "high",
+      "confidence": "medium",
+      "evidence": "A new route is registered pointing at an unreviewed view: `path(\"admin/raw\", views.admin_raw, name=\"admin-raw\")`",
+      "risk": "The route exposes an admin view whose authorization is not visible in this diff. If `admin_raw` lacks the decorator that was removed from `admin_panel`, this is a second unauthenticated path into admin functionality.",
+      "recommendation": "Confirm in the pull request that `admin_raw` enforces the same permission check, and state where that check lives."
+    }
+  ]
+}

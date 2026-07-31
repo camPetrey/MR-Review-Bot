@@ -17,6 +17,34 @@ make smoke       # ONE real API call. Manual only. Never in CI.
 
 <!-- Aspirational until M1 lands the Makefile. Make true or delete by end of day 2. -->
 
+Setup (no venv is committed):
+
+```
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+```
+
+Single test / single lint target:
+
+```
+.venv/bin/pytest tests/test_role_scanner.py::test_some_case
+.venv/bin/ruff check src/review_bot/cli.py
+```
+
+## Architecture
+
+Empty scaffold as of day 0 — every file under `src/review_bot/` is a stub. Pipeline order and
+module ownership (SPEC.md §4), for orientation before the modules have bodies:
+
+```
+diff -> diff_parser -> secret_masker -> role_scanner -> prompt_builder -> llm_client -> schema -> renderer -> output
+```
+
+`cli.py` orchestrates; every other module is one pipeline stage and owns exactly one thing
+(diff parsing, masking, deterministic rules, prompt assembly, the API call, validation/merge,
+Markdown rendering). Cross-stage logic belongs in the stage that owns the concern, not in
+`cli.py` — see the "Ask first" rule below before adding a new module.
+
 ## Invariants
 
 Correctness guarantees, not preferences. Breaking one is a bug even if tests pass.

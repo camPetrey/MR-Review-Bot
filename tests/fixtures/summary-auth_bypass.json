@@ -1,0 +1,5 @@
+{
+  "summary": "This change removes the `@login_required` decorator and the `is_admin` check from the admin panel view, adds a query-parameter fast path that returns the dashboard before any authorization runs, and registers a second admin route. Read together, these are an authentication bypass rather than three separate issues: the guard was removed and two ways to reach the guarded code were added in the same pull request. Start with the fast path in `src/app/views/admin.py`.",
+  "overall_risk": "high",
+  "pr_comment": "Automated security review, advisory only — this does not block the merge.\n\nThe `@login_required` decorator and the `request.user.is_admin` check were both removed from `admin_panel`, and the new `?internal=` fast path returns the dashboard before any authorization would run. A query parameter is attacker-controlled, so as written this looks reachable by anyone. Could you confirm where the permission check moved to? The new `admin/raw` route needs the same answer."
+}

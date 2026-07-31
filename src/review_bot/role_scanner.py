@@ -169,7 +169,7 @@ def _scan_file(parsed_file: ParsedFile, result: ScanResult) -> None:
     if parsed_file.is_binary:
         return
 
-    if _is_dependency_manifest(parsed_file.path):
+    if is_dependency_manifest(parsed_file.path):
         result.findings.append(_dependency_finding(parsed_file))
         # File-level, so there is no line to suppress; `prompt_builder` filters the whole
         # file out of LLM review anyway (§7).
@@ -412,7 +412,13 @@ def _strip_placeholders(content: str) -> str:
     return _PLACEHOLDER_RE.sub("", content)
 
 
-def _is_dependency_manifest(path: str) -> bool:
+def is_dependency_manifest(path: str) -> bool:
+    """True for the dependency manifests and lockfiles of §6 Tier 1.
+
+    Public because `prompt_builder` needs the same predicate to filter these files out of
+    LLM review (§7). The rule belongs to this module — the filter is a consequence of the
+    rule, not a second definition of it.
+    """
     basename = path.rsplit("/", 1)[-1]
     if basename.lower() in _DEPENDENCY_BASENAMES:
         return True

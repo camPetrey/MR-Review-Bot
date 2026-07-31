@@ -184,39 +184,28 @@ Pure summarization, which is Haiku's strength, and it recovers the cross-file na
 
 ### Determinism
 
-- **Temperature 0.** This is an accuracy task, not a generation task. Nothing here benefits from sampling diversity.
-- **Byte-stable prompt construction** — the larger lever. Temperature 0 is worthless if the prompt bytes drift between runs:
+- **~~Temperature 0.~~ Not available. [AMENDED M4]** The intent was right — this is an accuracy task, not a generation task — but `claude-sonnet-5` removed the sampling parameters. `temperature`, `top_p`, and `top_k` are rejected with a 400 rather than defaulted, so no request may carry them. The intended behaviour is the model's only behaviour, and this section's own next bullet already identified the larger lever, which is unaffected. Asserted in `test_llm_client.py::test_no_sampling_parameters_are_sent` so it cannot regress via `--model`.
+- **Byte-stable prompt construction** — now the *only* lever, and always the larger one. Prompt bytes must not drift between runs:
   - Sort file lists lexicographically
   - Sort deterministic findings by `(file, line, category)` before serialization
   - No timestamps, run IDs, or UUIDs anywhere in the prompt (they belong in the *output*)
   - Serialize with `json.dumps(..., sort_keys=True)`
-- **Prompt caching** on the system prompt. It is byte-identical across every call by construction; cache reads bill at 0.1x input. Minimum cacheable prompt is 512 tokens, and the system prompt is ~800.
+- **Prompt caching** on the system prompt. It is byte-identical across every call by construction; cache reads bill at 0.1x input, writes at 1.25x.
+  - **[AMENDED M4]** The minimum cacheable prefix on `claude-sonnet-5` is **1024 tokens, not 512** (512 is Opus 5's figure). A ~800-token system prompt would therefore never have cached — silently, with no error, just `cache_creation_input_tokens: 0` — and the cost model above assumes it does. The review system prompt is written past that threshold and `test_prompt_builder.py::test_system_prompt_clears_the_cache_minimum` fails if it drops back under.
 
 **Residual variance is accepted and documented.** Temperature 0 is not a determinism guarantee — floating-point non-associativity in batched inference and provider-side model updates mean roughly 90% run-to-run stability, not 100%.
 
 Rejected: run-twice-and-intersect. It doubles cost and cuts recall, trading true positives for the appearance of consistency.
 
-### Model selection rationale
+### Model selection 
 
-| Option | Cost @600 calls | Verdict |
-|---|---|---|
-| Haiku 4.5 | $5.34 | Too weak for security reasoning; used for summary only |
 | **Sonnet 5 (medium)** | **$10.68** | **Selected** |
-| GPT-5.6 Terra | $15.60 | 46% more, requires abandoning a fixed decision |
-| Opus 5 (medium) | $26.70 | Over budget |
-| GPT-5.6 Sol | $31.20 | Over budget |
 
 Sonnet 5 is $2/$10 per MTok through 2026-08-31; standard $3/$15 resumes 2026-09-01. The project completes before that date. **Pin the model ID and note the date in README.**
 
 Three reasons beyond cost:
 
-1. The task is bounded classification against a fixed 8-category rubric on a ~30-line diff — not open-ended reasoning. Opus earns its price on long-horizon agentic work; this is not that.
-2. Project risk sits in the deterministic layer, line validation, and prompt discipline. A stronger model moves none of them.
-3. An over-powered model masks a weak prompt. Tuning against Sonnet forces the prompt to carry its own weight, which is the transferable artifact.
-
 **Estimated total spend: $8–12 of the $20 ceiling**, leaving margin for M4 tuning re-runs.
-
-**Verify in M1:** the thinking-token estimates behind these figures are inferred, not measured, and could be off by ±40%. Make one real call, read `usage.output_tokens`, and replace the estimates. 20-minute task, de-risks the whole budget.
 
 ---
 
@@ -278,6 +267,8 @@ JSON is the source of truth. Markdown is rendered from it. Schema is exactly as 
 | `file` is not in the diff | Reject entirely, increment `hallucinated_file_count` |
 
 Both counters are emitted to stderr on every run and included in the CI job output.
+
+**[AMENDED M4] This table governs LLM findings only.** Deterministic findings are not validated against the added-line set, and must not be: the `auth_perms` rule's evidence is a line that no longer exists, so `role_scanner` anchors it to the nearest surviving post-image line — usually the context line the removed check used to guard. That is a real destination for the reviewer and the most useful one available. The guarantee this section exists to make still holds, and is the stronger reading of it: **no finding renders a line number absent from the post-image lines the diff shows.** Added-set membership is the tighter rule applied to the model, because a model citing a line it was never shown is a hallucination, whereas an anchor is a deliberate, tested placement. Asserted over every emitted finding in `test_cli.py::test_no_line_number_renders_that_is_not_in_the_diff`.
 
 **`unmappable_count` is a tuning metric, not an accepted condition.** The target is zero. If M4 tuning cannot drive it below ~5% of findings, the prompt is wrong — the fix is prompt work (echoing the valid line numbers into the prompt alongside each line of diff), not tolerance.
 
@@ -351,6 +342,10 @@ review-bot [DIFF_PATH | -] [options]
 | `2` | LLM returned malformed JSON. Prints the raw response verbatim. **No auto-repair.** |
 | `3` | Budget guard aborted the run |
 | `4` | Findings met `--fail-on` threshold (only reachable when the flag is set) |
+
+**[AMENDED M4] A failed API call is exit `0`, not a new code.** Network failure, an API error, and a safety refusal all leave the run able to do its job: §12 requires deterministic findings regardless, and the table's own framing is that the exit code signals *tool* failure. The failure is reported on stderr and the summary is synthesised locally, so the reviewer gets findings plus an explicit statement that coverage was partial. Malformed JSON keeps its own code because there the model *did* answer and the answer was unusable — that is a contract breach worth failing on.
+
+**Note on refusals.** `claude-sonnet-5` carries elevated cybersecurity safeguards, and a security-review tool sits in exactly the domain they watch. A refusal arrives as HTTP 200 with `stop_reason: "refusal"`, so it is checked explicitly rather than caught as an exception. There is no retry and no rephrase — §12's rejection of recovery around the API call applies here too.
 
 `--fail-on high` exists, is documented, and defaults off — the capability without the policy call.
 
@@ -457,6 +452,8 @@ Output goes to the job log and is uploaded as a build artifact (`review.md`, `re
 
 ## 22. Open items
 
-- Exact token budget for packing — tune in M4 once real usage figures exist
-- Whether the summary pass on Haiku is good enough, or needs to move to Sonnet — decide with evidence in M4
-- Optional M4 experiment: run all 5 sample diffs through `claude-opus-5` at medium once (~$0.50) and diff the findings against Sonnet's. If Opus consistently catches something Sonnet misses, revisit the model choice; if not, the decision is settled for fifty cents.
+- ~~Exact token budget for packing~~ — **[RESOLVED M4]** 8,000 stands as the default. All five sample diffs pack into a single call well under it (the largest estimates ~1.3k input tokens including the system prompt), so the splitting path is exercised by tests rather than by the samples. There is no evidence to tune against until a large real diff appears; `--max-input-tokens` remains the escape hatch.
+- Whether the summary pass on Haiku is good enough, or needs to move to Sonnet — **still open**, and now blocked on one live run rather than on implementation. Both call paths are built and mocked end to end; the decision needs `make smoke` output, which is deliberately manual.
+- Optional M4 experiment: run all 5 sample diffs through `claude-opus-5` at medium once (~$0.50) and diff the findings against Sonnet's. If Opus consistently catches something Sonnet misses, revisit the model choice; if not, the decision is settled for fifty cents. **Still open** — `--model` makes it a one-line experiment.
+- **[NEW M4] Structured outputs (`output_config.format`) for the two calls.** The API can constrain responses to a JSON schema, which would make the exit-2 path nearly unreachable. Deliberately *not* adopted without a decision, because §15's "malformed JSON → print raw, exit 2, no auto-repair" is a stated contract, and constraining generation changes what that contract is protecting against. It is a genuine improvement, not a repair step, so it is worth deciding on rather than assuming. Blocked on: does making a documented failure mode unreachable count as changing the schema, which §22 and CLAUDE.md say to ask about first?
+- **[NEW M4] `thinking` configuration for the review pass.** The call currently leaves adaptive thinking at the model default. Thinking tokens bill as output and count against `max_tokens`, so this is a live cost and truncation variable that no local test can measure. Tune with the first `make smoke` figures, alongside the §19 M1 instruction to correct the budget model from real `usage`.
