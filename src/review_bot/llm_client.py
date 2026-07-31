@@ -1,35 +1,17 @@
-"""Anthropic API calls, budget guards, caching (pipeline stage 5).
+"""Anthropic API calls, budget guards, caching (pipeline stage 5, SPEC.md §4).
 
-The only module that touches the network (SPEC.md §4). It owns the two calls of §8, the
-budget controls of §9, and the `--cache` / `--record` flags of §14.
+The only module that touches the network. It owns the two calls of §8, the budget controls
+of §9, and the `--cache` / `--record` flags of §14.
 
-## What this module deliberately does not do
+**It deliberately does not retry, fall back, or recover.** A failed call raises `LLMError`
+and the run continues on deterministic findings alone, which never depended on the network
+(§12); a retry loop would trade a visible failure for an invisible one and double the cost
+of a bad day. Nor does it repair output — it returns raw response text and `schema.py`
+decides whether that text is usable (§15).
 
-No retries, no fallback models, no error recovery. A failed call raises `LLMError` and the
-run continues with deterministic findings alone — those never depended on the network in
-the first place (§12). A retry loop here would trade a visible failure for an invisible
-one and double the cost of a bad day.
-
-Nor does it repair output. It returns raw response text; `schema.py` decides whether that
-text is valid, and an invalid response is exit 2 with the raw bytes printed (§15).
-
-## Determinism
-
-`temperature` is not sent. §8 specifies temperature 0, but `claude-sonnet-5` rejects
-non-default sampling parameters with a 400 — the parameter was removed from the model, not
-merely defaulted. The lever §8 itself calls the larger one is unaffected: prompts are
-byte-stable by construction in `prompt_builder`, and residual run-to-run variance was
-already documented as accepted (§21.6). SPEC.md §8 is amended alongside this module.
-
-## Caching
-
-Two unrelated things share the word:
-
-* **Prompt caching** (`cache_control` on the system block) is an API feature and always on.
-  The system prompts are module constants, so the cached prefix is byte-identical on every
-  call and reads bill at 0.1x.
-* **`--cache`** is this tool's own response cache on disk, off by default (§14). It exists
-  so the M6 demo runs unattended without depending on the network.
+Two unrelated things share the word "cache": **prompt caching** (`cache_control` on the
+system block) is an API feature, always on, and works because the system prompts are module
+constants; **`--cache`** is this tool's own response cache on disk, off by default.
 """
 
 from __future__ import annotations
@@ -63,6 +45,10 @@ _PRICING = {
     "claude-sonnet-5@intro": (2.00, 10.00),
     "claude-haiku-4-5-20251001": (1.00, 5.00),
     "claude-opus-5": (5.00, 25.00),
+    # Not a model this tool selects, but `--model` accepts anything and the unknown-model
+    # fallback below prices at the table maximum. Listing the most expensive model we know
+    # of is what keeps that fallback genuinely conservative.
+    "claude-fable-5": (10.00, 50.00),
 }
 SONNET_5_INTRO_ENDS = datetime.date(2026, 8, 31)
 
@@ -112,7 +98,9 @@ def _rates(model: str) -> tuple[float, float]:
         return _PRICING[model]
     # An unpinned model supplied via `--model`. Price it as the most expensive thing we
     # know about, so the budget guard stays conservative rather than silently permissive.
-    return max(_PRICING.values())
+    # Keyed on output rate: it dominates, since a call's output budget is what `preflight`
+    # has to assume in full.
+    return max(_PRICING.values(), key=lambda rates: rates[1])
 
 
 def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
@@ -143,22 +131,21 @@ def prompt_key(model: str, effort: str | None, prompt: Prompt) -> str:
 
 @dataclass
 class ResponseCache:
-    """On-disk cache of raw response text, keyed by `prompt_key`."""
+    """On-disk cache of raw response text, keyed by `prompt_key`.
+
+    There is no `enabled` flag: `LLMClient.cache is None` is the single representation of
+    "caching is off", and `--cache` is what decides whether one gets constructed at all.
+    """
 
     directory: Path
-    enabled: bool = False
 
     def get(self, key: str) -> str | None:
-        if not self.enabled:
-            return None
         path = self.directory / f"{key}.json"
         if not path.exists():
             return None
         return json.loads(path.read_text())["response"]
 
     def put(self, key: str, response: str) -> None:
-        if not self.enabled:
-            return
         self.directory.mkdir(parents=True, exist_ok=True)
         (self.directory / f"{key}.json").write_text(
             json.dumps({"response": response}, indent=2, sort_keys=True)
@@ -307,6 +294,12 @@ class LLMClient:
     ) -> tuple[str, Usage]:
         import anthropic
 
+        # No `temperature`/`top_p`/`top_k`. §8 asked for temperature 0, but `claude-sonnet-5`
+        # removed the sampling parameters rather than defaulting them — sending one is a 400,
+        # so no request may carry it. Determinism rests entirely on the lever §8 itself calls
+        # the larger one: prompts are byte-stable by construction in `prompt_builder`.
+        # `test_llm_client.py::test_no_sampling_parameters_are_sent` stops this regressing
+        # via `--model`.
         params: dict = {
             "model": model,
             "max_tokens": max_tokens,

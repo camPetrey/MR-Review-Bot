@@ -269,7 +269,13 @@ def test_pr_comment_and_advisory_framing_always_render() -> None:
 
 @pytest.mark.parametrize(
     "placeholder",
-    ["[MASKED_AWS_KEY]", "[MASKED_PRIVATE_KEY]", "[MASKED_DB_URL]", "[MASKED_TOKEN]", "[MASKED_KEY]"],
+    [
+        "[MASKED_AWS_KEY]",
+        "[MASKED_PRIVATE_KEY]",
+        "[MASKED_DB_URL]",
+        "[MASKED_TOKEN]",
+        "[MASKED_KEY]",
+    ],
 )
 def test_masked_placeholders_render_verbatim(placeholder: str) -> None:
     """The placeholder is what the reviewer sees, unescaped and unaltered (§13).

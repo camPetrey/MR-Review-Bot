@@ -5,13 +5,9 @@ to a stage: what to mask is `secret_masker`'s, what to suppress is `role_scanner
 to send is `prompt_builder`'s, whether to send it is `llm_client`'s, and whether the answer
 is usable is `schema.py`'s. What lives here is the order, the flags, and the exit codes.
 
-The order is load-bearing. Masking runs on the parsed diff before `prompt_builder` is even
-constructed, so no raw diff content can reach the API (invariant 1). Deterministic findings
-are collected before the first call and are emitted whether or not that call succeeds
-(invariant 3, §12).
-
-Timing is collected here for the same reason: a stage boundary is the only place that knows
-where one stage ends and the next begins. `--verbose` reports it (§14).
+The order is load-bearing: masking runs on the parsed diff before `prompt_builder` is even
+constructed (invariant 1), and deterministic findings are collected before the first call
+so they are emitted whether or not it succeeds (invariant 3, §12).
 """
 
 from __future__ import annotations
@@ -46,6 +42,7 @@ from .renderer import render_markdown
 from .role_scanner import register_suppressions, scan_diff
 from .schema import (
     Finding,
+    LLMSummaryResponse,
     MalformedLLMResponse,
     Review,
     ValidationStats,
@@ -99,7 +96,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-llm", action="store_true", help="Deterministic findings only")
     parser.add_argument("--max-input-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS)
     parser.add_argument("--max-run-cost", type=float, default=0.50)
-    parser.add_argument("--verbose", action="store_true", help="Per-call usage and timing to stderr")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Per-call usage and timing to stderr")
     return parser
 
 
@@ -138,13 +136,14 @@ def main(argv: list[str] | None = None) -> int:
 
     llm_findings: list[Finding] = []
     stats = ValidationStats()
-    summary: object | None = None
+    summary: LLMSummaryResponse | None = None
 
     skip_llm = args.no_llm or not batches
     if not batches and not args.no_llm:
         # Every file was filtered out. Invariant 6 again: nothing to review, no call.
         print("No files eligible for LLM review; deterministic findings only.", file=sys.stderr)
 
+    stem = _record_stem(args.diff)
     client = LLMClient(
         model=args.model,
         summary_model=args.summary_model,
@@ -152,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
         max_input_tokens=args.max_input_tokens,
         max_run_cost=args.max_run_cost,
         verbose=args.verbose,
-        cache=ResponseCache(args.cache_dir, enabled=args.cache) if args.cache else None,
+        cache=ResponseCache(args.cache_dir) if args.cache else None,
         record_dir=args.record,
     )
 
@@ -162,18 +161,12 @@ def main(argv: list[str] | None = None) -> int:
     if not skip_llm:
         try:
             with timings("review_pass"):
-                llm_findings, stats = _review_pass(client, batches, scan_result.suppressed, diff)
-        except MalformedLLMResponse as exc:
-            # §15: print the raw response verbatim and exit 2. No repair, no retry.
-            print(f"error: {exc}", file=sys.stderr)
-            print(exc.raw)
-            return EXIT_MALFORMED_LLM_JSON
-        except BudgetExceeded as exc:
-            print(f"error: budget guard aborted the run: {exc}", file=sys.stderr)
-            return EXIT_BUDGET
-        except LLMError as exc:
-            # Invariant 3: deterministic findings are still produced when the call fails.
-            print(f"warning: review pass failed, continuing without it: {exc}", file=sys.stderr)
+                llm_findings, stats = _review_pass(
+                    client, batches, scan_result.suppressed, diff, stem
+                )
+        except _LLM_FAILURES as exc:
+            if (code := _report_llm_failure(exc, "review pass")) is not None:
+                return code
             skip_llm = True
 
     with timings("merge"):
@@ -185,18 +178,13 @@ def main(argv: list[str] | None = None) -> int:
                 raw = client.summarize(
                     build_summary_prompt(
                         [f.path for f in filtered.reviewable], filtered.excluded, findings
-                    )
+                    ),
+                    label=f"summary-{stem}",
                 )
                 summary = parse_summary_response(raw)
-        except MalformedLLMResponse as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            print(exc.raw)
-            return EXIT_MALFORMED_LLM_JSON
-        except BudgetExceeded as exc:
-            print(f"error: budget guard aborted the run: {exc}", file=sys.stderr)
-            return EXIT_BUDGET
-        except LLMError as exc:
-            print(f"warning: summary pass failed, continuing without it: {exc}", file=sys.stderr)
+        except _LLM_FAILURES as exc:
+            if (code := _report_llm_failure(exc, "summary pass")) is not None:
+                return code
 
     review = _assemble(findings, summary, filtered)
     with timings("render"):
@@ -214,11 +202,37 @@ def main(argv: list[str] | None = None) -> int:
 # --------------------------------------------------------------------------------------
 
 
+#: The three ways an LLM stage can fail. `_report_llm_failure` maps each to an exit code.
+_LLM_FAILURES = (MalformedLLMResponse, BudgetExceeded, LLMError)
+
+
+def _report_llm_failure(exc: Exception, stage: str) -> int | None:
+    """Report a failed LLM stage; return its exit code, or None to continue without it.
+
+    §15 draws the line at whether the model answered. Malformed JSON is exit 2 with the raw
+    response printed verbatim — the model *did* answer and the answer was unusable, which
+    is a contract breach worth failing on, and there is no repair and no retry. A budget
+    abort is exit 3. Everything else — network failure, an API error, a refusal — is not a
+    *tool* failure: invariant 3 produces the deterministic findings regardless, so the run
+    says coverage was partial and carries on at exit 0.
+    """
+    if isinstance(exc, MalformedLLMResponse):
+        print(f"error: {exc}", file=sys.stderr)
+        print(exc.raw)
+        return EXIT_MALFORMED_LLM_JSON
+    if isinstance(exc, BudgetExceeded):
+        print(f"error: budget guard aborted the run: {exc}", file=sys.stderr)
+        return EXIT_BUDGET
+    print(f"warning: {stage} failed, continuing without it: {exc}", file=sys.stderr)
+    return None
+
+
 def _review_pass(
     client: LLMClient,
     batches: list,
     suppressed: set[tuple[str, int]],
     diff: ParsedDiff,
+    stem: str,
 ) -> tuple[list[Finding], ValidationStats]:
     """Call 1 over every batch, validating each response against the parsed diff (§11).
 
@@ -230,16 +244,14 @@ def _review_pass(
     stats = ValidationStats()
 
     for index, batch in enumerate(batches):
-        prompt = build_review_prompt(batch, suppressed)
-        raw = client.review(prompt, label=f"review-{index}")
-        parsed = parse_review_response(raw)
-        validated, batch_stats = validate_findings(parsed, diff)
+        # The batch index is only in the label when there is more than one batch, so the
+        # common single-batch run records to `review-<stem>.json` — the fixture name the
+        # contract test reads. See `_record_stem`.
+        suffix = f"-{index}" if len(batches) > 1 else ""
+        raw = client.review(build_review_prompt(batch, suppressed), label=f"review-{stem}{suffix}")
+        validated, batch_stats = validate_findings(parse_review_response(raw), diff)
         collected.extend(apply_confidence_caps(validated, batch))
-
-        stats.unmappable_count += batch_stats.unmappable_count
-        stats.hallucinated_file_count += batch_stats.hallucinated_file_count
-        stats.hallucinated_files.extend(batch_stats.hallucinated_files)
-        stats.unmappable_lines.extend(batch_stats.unmappable_lines)
+        stats.extend(batch_stats)
 
     return collected, stats
 
@@ -269,8 +281,7 @@ def _dry_run(args, client: LLMClient, batches, filtered, deterministic, suppress
     return EXIT_OK
 
 
-def _assemble(findings: list[Finding], summary, filtered) -> Review:
-    note = filtered.exclusion_summary()
+def _assemble(findings: list[Finding], summary: LLMSummaryResponse | None, filtered) -> Review:
     if summary is not None:
         return Review(
             summary=summary.summary,
@@ -282,15 +293,15 @@ def _assemble(findings: list[Finding], summary, filtered) -> Review:
 
     # No summary pass: --no-llm, or the call failed. Synthesise something honest rather
     # than leaving required fields empty — the JSON is the source of truth (§10).
-    risk = overall_risk(findings)
     counts = f"{len(findings)} finding(s)"
+    note = filtered.exclusion_summary()
     detail = f" {note}." if note else ""
     return Review(
         summary=(
             f"Deterministic review only (no model summary available). {counts} across "
             f"{len({f.file for f in findings})} file(s).{detail}"
         ),
-        overall_risk=risk,
+        overall_risk=overall_risk(findings),
         findings=findings,
         pr_comment=(
             f"Automated security review found {counts}. This run produced deterministic "
@@ -316,16 +327,19 @@ def _report_metrics(
     )
     if note := filtered.exclusion_summary():
         print(note, file=sys.stderr)
-    if verbose:
-        # Masking is the one stage whose success is invisible in the output: a run that
-        # masked nothing and a run whose masking silently no-opped look identical.
-        print(f"masked_line_count={mask_result.masked_line_count}", file=sys.stderr)
-        print(timings.report(), file=sys.stderr)
-    if verbose and client.usages:
+    if not verbose:
+        return
+
+    # Masking is the one stage whose success is invisible in the output: a run that masked
+    # nothing and a run whose masking silently no-opped look identical.
+    print(f"masked_line_count={mask_result.masked_line_count}", file=sys.stderr)
+    print(timings.report(), file=sys.stderr)
+    if client.usages:
         print(client.usage_summary(), file=sys.stderr)
-    if verbose and stats.unmappable_lines:
+    # The specific lines and files behind the counters above — what tuning acts on (§11).
+    if stats.unmappable_lines:
         print(f"unmappable lines: {stats.unmappable_lines}", file=sys.stderr)
-    if verbose and stats.hallucinated_files:
+    if stats.hallucinated_files:
         print(f"hallucinated files: {stats.hallucinated_files}", file=sys.stderr)
 
 
@@ -339,6 +353,17 @@ def _read_input(source: str) -> str:
     if source == "-":
         return sys.stdin.read()
     return Path(source).read_text()
+
+
+def _record_stem(source: str) -> str:
+    """Name `--record` output after the input diff, so `make record` overwrites the
+    fixtures the contract test actually reads (§17).
+
+    Labelling the calls `review`/`summary` alone would write one pair of files per run and
+    every diff would clobber the last; `tests/fixtures/` is keyed by sample diff, so the
+    stem has to be too. Also the `--verbose` log label, which is more use than an index.
+    """
+    return "stdin" if source == "-" else Path(source).stem
 
 
 def _empty_review(reason: str) -> Review:
@@ -398,10 +423,8 @@ def _emit(args, review: Review) -> None:
 class Timings:
     """Wall-clock time per pipeline stage, reported under `--verbose` (§14).
 
-    Deliberately wall-clock rather than CPU time: the number that matters to a reviewer
-    waiting on a run is how long the API calls took, and those are almost entirely spent
-    blocked on the network. Insertion order is preserved so the report reads as the
-    pipeline order, which is what makes an outlier stage obvious at a glance.
+    Wall-clock rather than CPU time because the number a reviewer waiting on a run cares
+    about is how long the API calls took, and those are spent blocked on the network.
     """
 
     def __init__(self) -> None:

@@ -1,23 +1,13 @@
 """JSON to Markdown (pipeline stage 7, SPEC.md §4, §13).
 
-The JSON is the source of truth; this module is a projection of it and adds no judgment
-of its own. It does not filter, cap, re-score, or re-order anything the schema settled —
-it only decides where on the page each finding lands.
+The JSON is the source of truth and this module is a projection of it: it adds no judgment,
+never filters, caps, re-scores, or re-orders what `schema.py` settled, and only decides
+where on the page each finding lands. Two artifacts that could disagree would mean neither
+is authoritative.
 
-Two of those decisions are load-bearing rather than cosmetic:
-
-* **Nothing is ever hidden.** There is no cap on findings (§13). A reviewer scrolling past
-  a long report is a worse outcome than a real finding silently truncated away, and noise
-  is a rule-tuning problem, not a rendering one.
-* **The header exists so the reviewer triages before scrolling.** Severity counts and the
-  skipped-file note come first, because the two questions asked of a review are "how bad"
-  and "what did it not look at" — and the second is invisible unless it is stated.
-
-Raw secret values cannot appear here because they were destroyed upstream: `secret_masker`
-substituted typed placeholders in the parsed diff before anything reached the network
-(invariant 1), so a `[MASKED_*]` token is all any evidence string can carry. This module
-renders evidence verbatim, which is what keeps that true — reconstructing or unescaping it
-would be the only way to break it. Asserted in `test_renderer.py`.
+Raw secret values cannot appear here because they were destroyed upstream (invariant 1), so
+a `[MASKED_*]` token is all any evidence string can carry. Rendering evidence verbatim is
+what keeps that true — reconstructing or unescaping it would be the only way to break it.
 """
 
 from __future__ import annotations
@@ -25,13 +15,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterable
 
-from .schema import Finding, Review
-
-#: High to low. Findings sort descending on both severity and confidence (§13), so the
-#: ordinals are negated in the sort key rather than reversing the whole tuple — line number
-#: still ascends.
-_SEVERITY_RANK = {"high": 2, "medium": 1, "low": 0}
-_CONFIDENCE_RANK = {"high": 2, "medium": 1, "low": 0}
+from .schema import RANK, Finding, Review
 
 #: Descending, so the header always reads `high · medium · low` regardless of what is present.
 _SEVERITY_DISPLAY_ORDER = ("high", "medium", "low")
@@ -125,10 +109,15 @@ def group_by_file(findings: list[Finding]) -> list[tuple[str, list[Finding]]]:
 
 
 def _finding_sort_key(finding: Finding) -> tuple[int, int, int, str]:
-    """Severity desc, confidence desc, then line ascending with file-level first (§13)."""
+    """Severity desc, confidence desc, then line ascending with file-level first (§13).
+
+    The ordinals are negated rather than reversing the whole tuple, so line number still
+    ascends. Category breaks the remaining ties to keep the order total, and therefore
+    stable across runs regardless of the input order.
+    """
     return (
-        -_SEVERITY_RANK[finding.severity],
-        -_CONFIDENCE_RANK[finding.confidence],
+        -RANK[finding.severity],
+        -RANK[finding.confidence],
         -1 if finding.line is None else finding.line,
         finding.category,
     )

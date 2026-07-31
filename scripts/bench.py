@@ -80,7 +80,10 @@ def main() -> int:
         parse_s = time_it(lambda t=text: parse_diff(t))
         mask_s = time_it(lambda t=text: mask_diff(parse_diff(t))) - parse_s
         scan_s = time_it(lambda t=text: scan_diff(parse_diff(t))) - parse_s
-        pack_s = time_it(lambda t=text: pack(filter_files(parse_diff(t)).reviewable, 8000)) - parse_s
+        def pack_stage(t=text):
+            return pack(filter_files(parse_diff(t)).reviewable, 8000)
+
+        pack_s = time_it(pack_stage) - parse_s
 
         total = parse_s + mask_s + scan_s + pack_s
         per_file = total / count

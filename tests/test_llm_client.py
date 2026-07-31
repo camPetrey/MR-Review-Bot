@@ -234,7 +234,7 @@ def test_cache_is_off_by_default() -> None:
 
 
 def test_cache_hit_skips_the_api_call(tmp_path) -> None:
-    cache = ResponseCache(tmp_path, enabled=True)
+    cache = ResponseCache(tmp_path)
     client, sdk = client_with(_StubResponse('{"findings": []}'), cache=cache)
 
     first = client.review(a_prompt())

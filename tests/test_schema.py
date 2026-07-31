@@ -300,7 +300,11 @@ def test_merged_output_is_sorted_for_stable_output() -> None:
         Finding(**a_finding(file="src/a.py", line=None), source="llm"),
     ]
     merged = merge_findings([], findings)
-    assert [(f.file, f.line) for f in merged] == [("src/a.py", None), ("src/a.py", 9), ("src/z.py", 2)]
+    assert [(f.file, f.line) for f in merged] == [
+        ("src/a.py", None),
+        ("src/a.py", 9),
+        ("src/z.py", 2),
+    ]
 
 
 # ------------------------------------------------------------------------------------

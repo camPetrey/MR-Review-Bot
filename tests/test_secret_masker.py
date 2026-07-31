@@ -140,7 +140,9 @@ def test_recommendation_always_mentions_rotation() -> None:
 def test_only_added_lines_are_scanned() -> None:
     """A secret on a removed line was already in the repo; this PR did not introduce it."""
     diff = build_diff(
-        "src/app/config.py", removed=['KEY = "AKIAIOSFODNN7EXAMPLE"'], added=["KEY = os.environ['K']"]
+        "src/app/config.py",
+        removed=['KEY = "AKIAIOSFODNN7EXAMPLE"'],
+        added=["KEY = os.environ['K']"],
     )
     result = mask_diff(diff)
     assert result.findings == []

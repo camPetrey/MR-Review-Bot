@@ -1,20 +1,9 @@
-"""Output schema (pipeline stage 6).
+"""Output schema (pipeline stage 6): pydantic models, line validation, merge (SPEC.md §4).
 
-This module owns the pydantic models for the whole tool (SPEC.md §4), plus the three
-things that stand between an untrusted model response and the reviewer:
-
-* **Parsing.** `parse_review_response` / `parse_summary_response` validate raw text
-  against a pydantic model. Anything that does not validate raises `MalformedLLMResponse`,
-  which carries the raw text so `cli.py` can print it verbatim and exit 2. There is no
-  repair step and no retry (§15).
-* **Line validation.** `validate_findings` checks every LLM `(file, line)` against the
-  added-line set `diff_parser` produced. A line that is not in that set degrades to
-  `line: null`; a file that is not in the diff is rejected outright (§11).
-* **Merge.** `merge_findings` dedupes deterministic and LLM findings, lets the
-  deterministic side win on conflict, and promotes confidence where the two agree (§12).
-
-The ordering matters: parse, then validate, then merge. Merging before validation would
-let a hallucinated file survive by colliding with a real deterministic finding.
+Everything standing between an untrusted model response and the reviewer lives here, and
+the order is load-bearing: parse (§15), then validate (§11), then merge (§12). Merging
+before validation would let a hallucinated file survive by colliding with a real
+deterministic finding.
 """
 
 from __future__ import annotations
@@ -41,6 +30,11 @@ Category = Literal[
     "crypto_misuse",
 ]
 Source = Literal["deterministic", "llm", "both"]
+
+#: Ordinal for both severity and confidence — they share a scale. One definition, because
+#: `prompt_builder` (confidence caps), `renderer` (sorting), and the merge rules below all
+#: compare these, and three private copies would be three chances to disagree.
+RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 
 #: Categories the LLM is allowed to report. `hardcoded_secrets` is deterministic-only —
 #: a masked value cannot be evidenced without unmasking it (§5).
@@ -259,6 +253,14 @@ class ValidationStats:
     hallucinated_files: list[str] = field(default_factory=list)
     unmappable_lines: list[tuple[str, int]] = field(default_factory=list)
 
+    def extend(self, other: ValidationStats) -> None:
+        """Fold another batch's stats in. Lives here so a new field is added in one place —
+        `cli.py` accumulates per batch and would otherwise silently drop it."""
+        self.unmappable_count += other.unmappable_count
+        self.hallucinated_file_count += other.hallucinated_file_count
+        self.hallucinated_files.extend(other.hallucinated_files)
+        self.unmappable_lines.extend(other.unmappable_lines)
+
 
 def validate_findings(
     findings: list[Finding], diff: ParsedDiff
@@ -296,8 +298,6 @@ def validate_findings(
 # --------------------------------------------------------------------------------------
 # Merge, dedupe, confidence promotion (§12)
 # --------------------------------------------------------------------------------------
-
-_CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
 def merge_findings(deterministic: list[Finding], llm: list[Finding]) -> list[Finding]:
@@ -358,14 +358,11 @@ def _keep_stronger(first: Finding, second: Finding) -> Finding:
     Reachable when two deterministic rules in one category fire on one line, or when the
     model reports the same finding twice.
     """
-    if _CONFIDENCE_ORDER[second.confidence] > _CONFIDENCE_ORDER[first.confidence]:
-        return second
-    return first
+    return second if RANK[second.confidence] > RANK[first.confidence] else first
 
 
 def _max_severity(first: Severity, second: Severity) -> Severity:
-    order = {"low": 0, "medium": 1, "high": 2}
-    return first if order[first] >= order[second] else second
+    return first if RANK[first] >= RANK[second] else second
 
 
 def overall_risk(findings: list[Finding]) -> Severity:
@@ -377,4 +374,4 @@ def overall_risk(findings: list[Finding]) -> Severity:
     """
     if not findings:
         return "low"
-    return max((f.severity for f in findings), key=lambda s: {"low": 0, "medium": 1, "high": 2}[s])
+    return max((f.severity for f in findings), key=lambda s: RANK[s])

@@ -1,33 +1,8 @@
-"""Filtering, packing, and prompt assembly (pipeline stage 4).
+"""Filtering, packing, and prompt assembly (pipeline stage 4, SPEC.md §4).
 
 Everything between "the diff has been masked and scanned" and "there is a request body to
-send" lives here (SPEC.md §4). Three jobs:
-
-* **Filter** (§7). Binary files, files with no added lines, dependency manifests, and
-  generated or vendored paths never reach the model. Excluded files are counted and
-  reported so the reviewer knows what was skipped.
-* **Pack** (§7). Whole files are bin-packed into calls up to a token budget. A file that
-  exceeds the budget alone is split by hunk, and findings from those chunks are capped at
-  `confidence: medium`.
-* **Assemble** (§8). The system prompt is a module constant, byte-identical on every call
-  by construction, which is what makes it cacheable. The user message is built from sorted
-  inputs and `json.dumps(..., sort_keys=True)`, with no timestamps or run IDs anywhere.
-
-## Why the prompt echoes line numbers
-
-§11 sets `unmappable_count` at zero and names the fix: echo the valid line numbers into
-the prompt alongside each line of diff. So every added line is rendered with its post-file
-number in the gutter, and each file block is preceded by the explicit set of numbers the
-model may cite. Context and removed lines are rendered *without* a number, because citing
-one is by definition unmappable — the reviewer cannot be sent to a line this PR did not
-add. That makes the valid answer set visible rather than inferable.
-
-## Suppression, not hinting
-
-The suppression list names `(file, line)` pairs Tier 1 already covered, and tells the
-model to stay away from them. Tier 2 hits are deliberately absent (§8, §12): feeding them
-in would anchor the model into confirming a regex match, and §12 needs the two detectors
-independent for agreement to mean anything.
+send": filter the files the model gains nothing from (§7), bin-pack the rest into calls
+under a token budget (§7), and assemble a byte-stable prompt (§8).
 """
 
 from __future__ import annotations
@@ -38,7 +13,7 @@ from dataclasses import dataclass, field
 
 from .diff_parser import Hunk, ParsedDiff, ParsedFile
 from .role_scanner import is_dependency_manifest
-from .schema import Finding
+from .schema import RANK, Finding
 
 #: Default per-call input budget (§7). `cli.py` overrides via `--max-input-tokens`.
 DEFAULT_MAX_INPUT_TOKENS = 8000
@@ -138,9 +113,12 @@ def _exclusion_reason(parsed_file: ParsedFile) -> ExclusionReason | None:
 def render_file_block(parsed_file: ParsedFile, hunks: list[Hunk] | None = None) -> str:
     """Render one file (or a subset of its hunks) as prompt text.
 
-    The gutter carries the post-file line number for added lines and nothing for context
-    and removed lines, and `citable_lines` states the answer set outright. Both exist to
-    drive `unmappable_count` to zero (§11).
+    §11 sets `unmappable_count` at zero and names the fix: echo the valid line numbers into
+    the prompt. So added lines carry their post-file number in the gutter and
+    `citable_lines` states the answer set outright, making it visible rather than
+    inferable. Context and removed lines are rendered *without* a number, because citing
+    one is by definition unmappable — the reviewer cannot be sent to a line this PR did
+    not add.
     """
     hunks = parsed_file.hunks if hunks is None else hunks
     citable = sorted(
@@ -430,6 +408,11 @@ class Prompt:
 def build_review_prompt(batch: Batch, suppressed: set[tuple[str, int]]) -> Prompt:
     """Build call 1's prompt for one batch (§8).
 
+    The suppression list names the `(file, line)` pairs Tier 1 already covered and tells
+    the model to stay away. Tier 2 hits are deliberately absent (§8, §12): feeding them in
+    would anchor the model into confirming a regex match, and §12 needs the two detectors
+    independent for their agreement to mean anything.
+
     Only suppressions for files in this batch are included: naming a file the model cannot
     see is noise, and it would make the prompt depend on the rest of the diff, costing
     byte-stability for batches that would otherwise be identical.
@@ -484,10 +467,10 @@ def apply_confidence_caps(findings: list[Finding], batch: Batch) -> list[Finding
     Applied after parsing rather than asked of the model: the model does not know it was
     shown a chunk, and a cap it can forget to apply is not a cap.
     """
-    order = {"low": 0, "medium": 1, "high": 2}
     capped: list[Finding] = []
     for finding in findings:
-        if batch.confidence_cap(finding.file) == "medium" and order[finding.confidence] > 1:
+        capped_file = batch.confidence_cap(finding.file) == "medium"
+        if capped_file and RANK[finding.confidence] > RANK["medium"]:
             finding = finding.model_copy(update={"confidence": "medium"})
         capped.append(finding)
     return capped

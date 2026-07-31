@@ -17,7 +17,7 @@ import pytest
 from conftest import SAMPLE_DIFFS
 
 from review_bot import cli
-from review_bot.llm_client import LLMError
+from review_bot.llm_client import REVIEW_MAX_TOKENS, LLMError, Usage
 
 SAMPLES = ["auth_bypass", "injection_and_logging", "secrets_and_logging"]
 
@@ -415,3 +415,34 @@ def test_output_is_stable_across_identical_runs(capsys, fake_llm) -> None:
         cli.main([str(SAMPLE_DIFFS / "auth_bypass.diff")])
         outputs.append(capsys.readouterr().out)
     assert outputs[0] == outputs[1]
+
+
+# ------------------------------------------------------------------------------------
+# --record (§14, §17)
+# ------------------------------------------------------------------------------------
+
+
+def test_record_writes_fixture_names_derived_from_the_diff(capsys, monkeypatch, tmp_path) -> None:
+    """`make record` must overwrite the fixtures the contract test reads, not new files.
+
+    This patches `_send` rather than using the `fake_llm` fixture, because recording is
+    inside `LLMClient` and stubbing `review`/`summarize` would skip the code under test.
+    The bug this catches is silent: labels not keyed to the diff wrote `review-0.json` and
+    `summary.json` while `tests/fixtures/` kept validating the stale originals.
+    """
+    def fake_send(self, prompt, *, model, max_tokens, effort):
+        return (review_json() if max_tokens == REVIEW_MAX_TOKENS else summary_json(), Usage())
+
+    monkeypatch.setattr(cli.LLMClient, "_send", fake_send)
+    run([str(SAMPLE_DIFFS / "auth_bypass.diff"), "--record", str(tmp_path)], capsys)
+
+    assert sorted(p.name for p in tmp_path.glob("*.json")) == [
+        "review-auth_bypass.json",
+        "summary-auth_bypass.json",
+    ]
+
+
+def test_record_stem_names_stdin_runs() -> None:
+    """A piped diff has no filename; CI pipes `git diff` in, so it still needs a stem."""
+    assert cli._record_stem("-") == "stdin"
+    assert cli._record_stem("sample_diffs/auth_bypass.diff") == "auth_bypass"

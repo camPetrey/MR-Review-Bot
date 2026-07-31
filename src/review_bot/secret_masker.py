@@ -1,31 +1,10 @@
-"""Secret masking (pipeline stage 2).
+"""Secret masking (pipeline stage 2, SPEC.md §5).
 
-Runs on the parsed diff **before** anything reaches the network (SPEC.md §5). Two jobs:
-
-1. Rewrite `DiffLine.content` in place so raw secret values are replaced by typed
-   placeholders. Substitution preserves line numbers and diff alignment.
-2. Emit the `hardcoded_secrets` findings directly. That category is deterministic-only —
-   the LLM never reports it, because a masked value cannot be evidenced without
-   unmasking it (§5).
-
-## Why `scan_file` and not `scan_line`
-
-`detect_secrets.core.scan.scan_line` runs with `enable_eager_search=True`, which bypasses
-the entropy plugins' limit and flags every word on the line — `SELECT`, `FROM`, and
-`users` all come back as high-entropy strings. That is the adhoc "is this pasted string a
-secret" path, not a code scanner, and it would put Tier 1 hits all over
-`clean_but_suspicious.diff`. `scan_file` applies the real limits and filters, so the added
-lines are written to a temp file (keeping the original basename, so extension-based
-filters still apply) and scanned there.
-
-## Why the whole literal is masked, not the matched value
-
-Several detectors return a *truncated* value: `GitHubTokenDetector` reports `ghp` for
-`ghp_16C7e42F...`, and `StripeDetector` drops the last few characters. Substituting just
-the reported value would leave the rest of the credential in the prompt, breaking the
-"raw secret values never appear in output" invariant. So a flagged line has its enclosing
-string literal replaced whole; where there is no literal, the value after the assignment
-operator goes.
+Runs on the parsed diff **before** anything reaches the network. Two jobs: rewrite
+`DiffLine.content` in place so raw values become typed placeholders (preserving line
+numbers and diff alignment), and emit the `hardcoded_secrets` findings directly. That
+category is deterministic-only — the LLM never reports it, because a masked value cannot
+be evidenced without unmasking it.
 """
 
 from __future__ import annotations
@@ -181,6 +160,13 @@ def _mask_file(parsed_file: ParsedFile, tmpdir: str) -> tuple[list[Finding], int
 def _scan(path: str, contents: list[str], tmpdir: str) -> dict[int, str]:
     """Scan added-line contents; return `{index into contents: winning detector type}`.
 
+    Uses `scan_file`, not `scan_line`, which is why the lines are written to a temp file
+    first: `scan_line` runs with `enable_eager_search=True`, bypassing the entropy plugins'
+    limit so that every word comes back a secret — `SELECT`, `FROM`, and `users` included.
+    That is the adhoc "is this pasted string a secret" path, not a code scanner, and it
+    would put Tier 1 hits all over `clean_but_suspicious.diff`. `scan_file` applies the
+    real limits and filters.
+
     detect-secrets reports 1-based line numbers against the temp file, which map straight
     back onto `contents` by index. `tmpdir` and the plugin settings are owned by
     `mask_diff`, which enters both once for the whole diff.
@@ -193,7 +179,7 @@ def _scan(path: str, contents: list[str], tmpdir: str) -> dict[int, str]:
     # temp directory across every file, and `src/a/config.py` and `src/b/config.py` would
     # otherwise overwrite each other's scan input.
     scan_dir = os.path.join(tmpdir, hashlib.sha256(path.encode()).hexdigest()[:16])
-    os.mkdir(scan_dir)
+    os.makedirs(scan_dir, exist_ok=True)
     scan_path = os.path.join(scan_dir, os.path.basename(path) or "snippet.txt")
     with open(scan_path, "w", encoding="utf-8") as handle:
         handle.write("\n".join(contents) + "\n")
@@ -230,6 +216,12 @@ def _placeholder_for(secret_type: str, content: str) -> str:
 def _mask_line(content: str, placeholder: str, secret_type: str) -> str:
     """Replace the credential on `content` with `placeholder`.
 
+    The whole enclosing literal goes, not the value the detector reported, because several
+    detectors report a *truncated* one — `GitHubTokenDetector` returns `ghp` for
+    `ghp_16C7e42F...`, `StripeDetector` drops the last few characters. Substituting only
+    what was reported would leave the rest of the credential in the prompt, breaking
+    invariant 7. Where there is no literal, the value after the assignment operator goes.
+
     A private key line is replaced wholesale: PEM bodies are unquoted, span many lines, and
     there is no safe substring to keep.
     """
@@ -244,7 +236,8 @@ def _mask_line(content: str, placeholder: str, secret_type: str) -> str:
         result = content
         for match in reversed(quoted):
             quote = match.group(1)
-            result = result[: match.start()] + f"{quote}{placeholder}{quote}" + result[match.end() :]
+            masked = f"{quote}{placeholder}{quote}"
+            result = result[: match.start()] + masked + result[match.end() :]
         return result
 
     return _mask_bare_token(content, placeholder)
