@@ -12,10 +12,46 @@ Do not restate spec decisions here — cite the section.
 ```
 make test        # pytest, no network
 make lint        # ruff
-make smoke       # ONE real API call. Manual only. Never in CI.
+make bench       # time the deterministic stages, no network
+make dry-run     # build and price the prompts, send nothing
+make smoke       # ONE real API call pair. Manual only. Never in CI.
+make record      # overwrite tests/fixtures/ from live responses
 ```
 
-<!-- Aspirational until M1 lands the Makefile. Make true or delete by end of day 2. -->
+Setup (no venv is committed):
+
+```
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+```
+
+Single test / single lint target:
+
+```
+.venv/bin/pytest tests/test_role_scanner.py::test_some_case
+.venv/bin/ruff check src/review_bot/cli.py
+```
+
+## Architecture
+
+All stages are implemented as of M5. Pipeline order and module ownership (SPEC.md §4):
+
+```
+diff -> diff_parser -> secret_masker -> role_scanner -> prompt_builder -> llm_client -> schema -> renderer -> output
+```
+
+`cli.py` orchestrates; every other module is one pipeline stage and owns exactly one thing
+(diff parsing, masking, deterministic rules, prompt assembly, the API call, validation/merge,
+Markdown rendering). Cross-stage logic belongs in the stage that owns the concern, not in
+`cli.py` — see the "Ask first" rule below before adding a new module.
+
+Two things live outside the pipeline: `scripts/bench.py` (local timing harness, no network)
+and `.github/workflows/` (§18). Neither is a stage; neither is imported by one.
+
+**Cost lives at stage boundaries, not in the loops.** The masker's plugin configuration is
+entered once per *diff*, not once per file — that one change halved the stage. Before
+optimizing anything here, run `make bench` and read the per-file column: flat is correct,
+rising means fixed setup is being paid per file.
 
 ## Invariants
 
@@ -62,6 +98,9 @@ Adding a dependency. Adding a module. Changing an exit code or the schema. Anyth
   test in the suite. Do not skip or xfail it to get CI green.
 - New deterministic rule → new case in `test_role_scanner.py`, same commit.
 - `clean_but_suspicious.diff` must produce zero Tier 1 hits. False-positive canary.
+- Performance is guarded structurally, never by wall clock — assert the call count that was
+  fixed, not a millisecond threshold. A timing assertion on a shared CI runner is a flaky
+  test, and a flaky test gets ignored within a week. `make bench` is where the numbers live.
 
 ## Workflow
 

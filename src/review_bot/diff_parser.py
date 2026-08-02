@@ -1,19 +1,13 @@
-"""Unified-diff parsing (pipeline stage 1).
+"""Unified-diff parsing (pipeline stage 1, SPEC.md §4).
 
-Wraps `unidiff` and re-exposes it as plain dataclasses the rest of the pipeline can
-depend on. Every later stage reads this structure and nothing reaches back into
-`unidiff` itself (SPEC.md §4).
+Wraps `unidiff` and re-exposes it as plain dataclasses; every later stage reads this
+structure and nothing reaches back into `unidiff` itself. Two guarantees it exists to
+provide: `ParsedFile.added_line_numbers` is the authoritative set `schema.py` validates LLM
+findings against (§11), and `DiffLine.content` is mutable so `secret_masker` can substitute
+in place without disturbing line numbers (§5).
 
-Two guarantees this stage exists to provide:
-
-* **Post-file line numbers.** `ParsedFile.added_line_numbers` is the authoritative set
-  `schema.py` validates LLM findings against, so no line number that is absent from the
-  diff can ever render (§11).
-* **Mutable line content.** `secret_masker` substitutes placeholders in place on
-  `DiffLine.content`, which keeps line numbers and diff alignment intact (§5).
-
-File order is left exactly as it appeared in the diff. Lexicographic sorting is
-`prompt_builder`'s job, done at packing time for byte-stability (§7).
+File order is left exactly as the diff gave it — lexicographic sorting is `prompt_builder`'s
+job, done at packing time for byte-stability (§7).
 """
 
 from __future__ import annotations
@@ -107,12 +101,15 @@ class ParsedFile:
 
     @property
     def added_line_numbers(self) -> frozenset[int]:
-        """Post-file line numbers of added lines — the set `schema.py` validates against (§11)."""
+        """Post-file line numbers of added lines.
+
+        The authoritative set `schema.py` validates LLM findings against (§11).
+        """
         return frozenset(ln.line_no for ln in self.added_lines if ln.line_no is not None)
 
     @property
     def has_added_lines(self) -> bool:
-        """False for pure deletions, pure renames, mode changes, and binaries — all filtered (§7)."""
+        """False for pure deletions, renames, mode changes, and binaries — all filtered (§7)."""
         return any(hunk.added_lines for hunk in self.hunks)
 
 
@@ -130,7 +127,7 @@ class ParsedDiff:
 
     @property
     def has_reviewable_changes(self) -> bool:
-        """False means exit 0 without calling the API — never spend money on an empty diff (§15)."""
+        """False means exit 0 without calling the API — never pay for an empty diff (§15)."""
         return any(f.has_added_lines for f in self.files)
 
     def file(self, path: str) -> ParsedFile | None:

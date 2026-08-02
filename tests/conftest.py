@@ -16,11 +16,18 @@ from review_bot.diff_parser import ParsedDiff, parse_diff
 
 SAMPLE_DIFFS = Path(__file__).parent.parent / "sample_diffs"
 TEST_DIFFS = Path(__file__).parent / "diffs"
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 @pytest.fixture
 def sample_diffs() -> Path:
     return SAMPLE_DIFFS
+
+
+@pytest.fixture
+def fixtures_dir() -> Path:
+    """Recorded LLM responses (§17). `--record` overwrites these from live calls."""
+    return FIXTURES
 
 
 def build_diff(

@@ -1,35 +1,15 @@
-"""Secret masking (pipeline stage 2).
+"""Secret masking (pipeline stage 2, SPEC.md §5).
 
-Runs on the parsed diff **before** anything reaches the network (SPEC.md §5). Two jobs:
-
-1. Rewrite `DiffLine.content` in place so raw secret values are replaced by typed
-   placeholders. Substitution preserves line numbers and diff alignment.
-2. Emit the `hardcoded_secrets` findings directly. That category is deterministic-only —
-   the LLM never reports it, because a masked value cannot be evidenced without
-   unmasking it (§5).
-
-## Why `scan_file` and not `scan_line`
-
-`detect_secrets.core.scan.scan_line` runs with `enable_eager_search=True`, which bypasses
-the entropy plugins' limit and flags every word on the line — `SELECT`, `FROM`, and
-`users` all come back as high-entropy strings. That is the adhoc "is this pasted string a
-secret" path, not a code scanner, and it would put Tier 1 hits all over
-`clean_but_suspicious.diff`. `scan_file` applies the real limits and filters, so the added
-lines are written to a temp file (keeping the original basename, so extension-based
-filters still apply) and scanned there.
-
-## Why the whole literal is masked, not the matched value
-
-Several detectors return a *truncated* value: `GitHubTokenDetector` reports `ghp` for
-`ghp_16C7e42F...`, and `StripeDetector` drops the last few characters. Substituting just
-the reported value would leave the rest of the credential in the prompt, breaking the
-"raw secret values never appear in output" invariant. So a flagged line has its enclosing
-string literal replaced whole; where there is no literal, the value after the assignment
-operator goes.
+Runs on the parsed diff **before** anything reaches the network. Two jobs: rewrite
+`DiffLine.content` in place so raw values become typed placeholders (preserving line
+numbers and diff alignment), and emit the `hardcoded_secrets` findings directly. That
+category is deterministic-only — the LLM never reports it, because a masked value cannot
+be evidenced without unmasking it.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import tempfile
@@ -136,55 +116,81 @@ def path_signal(path: str) -> str:
 
 
 def mask_diff(diff: ParsedDiff) -> MaskResult:
-    """Mask every added line in `diff` in place and return the `hardcoded_secrets` findings.
+    """Mask every line in `diff` in place and return the `hardcoded_secrets` findings.
 
-    Only added lines are scanned. A secret on a context or removed line was already in the
-    repository and is not something this PR introduced.
+    Every line kind is masked — added, removed, and context — because all three are quoted
+    downstream: added lines by the prompt and the rules' evidence, removed and context
+    lines by the prompt and the `auth_perms` rule. Invariants 1 and 7 are unconditional,
+    so no line kind may carry a raw value past this stage.
+
+    *Findings* are emitted for added lines only. A secret on a removed or context line was
+    already in the repository and is not something this PR introduced; it is masked, not
+    reported.
     """
     findings: list[Finding] = []
     masked = 0
-    for parsed_file in diff.files:
-        file_findings, file_masked = _mask_file(parsed_file)
-        findings.extend(file_findings)
-        masked += file_masked
+
+    # Both context managers are entered once per *diff*, not once per file. Entering
+    # `transient_settings` rebuilds every plugin object and busts detect-secrets' internal
+    # caches, which profiles at roughly half of this stage's cost — paying that 40 times on
+    # a 40-file diff is pure waste, since the settings are identical every time. Scoping is
+    # unchanged: the block still closes before `mask_diff` returns, so no global state
+    # leaks out of the stage.
+    with transient_settings({"plugins_used": _PLUGINS}), tempfile.TemporaryDirectory() as tmpdir:
+        for parsed_file in diff.files:
+            file_findings, file_masked = _mask_file(parsed_file, tmpdir)
+            findings.extend(file_findings)
+            masked += file_masked
+
     findings.sort(key=lambda f: f.sort_key())
     return MaskResult(findings=findings, masked_line_count=masked)
 
 
-def _mask_file(parsed_file: ParsedFile) -> tuple[list[Finding], int]:
-    added = parsed_file.added_lines
-    if parsed_file.is_binary or not added:
+def _mask_file(parsed_file: ParsedFile, tmpdir: str) -> tuple[list[Finding], int]:
+    lines = [ln for hunk in parsed_file.hunks for ln in hunk.lines]
+    if parsed_file.is_binary or not lines:
         return [], 0
 
-    hits = _scan(parsed_file.path, [ln.content for ln in added])
+    hits = _scan(parsed_file.path, [ln.content for ln in lines], tmpdir)
     signal = path_signal(parsed_file.path)
 
     findings: list[Finding] = []
     for index, secret_type in sorted(hits.items()):
-        line = added[index]
+        line = lines[index]
         placeholder = _placeholder_for(secret_type, line.content)
         line.content = _mask_line(line.content, placeholder, secret_type)
-        findings.append(_finding(parsed_file.path, line, secret_type, placeholder, signal))
+        if line.is_added:
+            findings.append(_finding(parsed_file.path, line, secret_type, placeholder, signal))
     return findings, len(hits)
 
 
-def _scan(path: str, contents: list[str]) -> dict[int, str]:
+def _scan(path: str, contents: list[str], tmpdir: str) -> dict[int, str]:
     """Scan added-line contents; return `{index into contents: winning detector type}`.
 
+    Uses `scan_file`, not `scan_line`, which is why the lines are written to a temp file
+    first: `scan_line` runs with `enable_eager_search=True`, bypassing the entropy plugins'
+    limit so that every word comes back a secret — `SELECT`, `FROM`, and `users` included.
+    That is the adhoc "is this pasted string a secret" path, not a code scanner, and it
+    would put Tier 1 hits all over `clean_but_suspicious.diff`. `scan_file` applies the
+    real limits and filters.
+
     detect-secrets reports 1-based line numbers against the temp file, which map straight
-    back onto `contents` by index.
+    back onto `contents` by index. `tmpdir` and the plugin settings are owned by
+    `mask_diff`, which enters both once for the whole diff.
     """
     if not contents:
         return {}
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Keep the original basename so extension-driven filters behave as they would on
-        # the real file.
-        scan_path = os.path.join(tmpdir, os.path.basename(path) or "snippet.txt")
-        with open(scan_path, "w", encoding="utf-8") as handle:
-            handle.write("\n".join(contents) + "\n")
-        with transient_settings({"plugins_used": _PLUGINS}):
-            potential = list(scan.scan_file(scan_path))
+    # Keep the original basename so extension-driven filters behave as they would on the
+    # real file, but nest it under a digest of the full path: `mask_diff` now shares one
+    # temp directory across every file, and `src/a/config.py` and `src/b/config.py` would
+    # otherwise overwrite each other's scan input.
+    scan_dir = os.path.join(tmpdir, hashlib.sha256(path.encode()).hexdigest()[:16])
+    os.makedirs(scan_dir, exist_ok=True)
+    scan_path = os.path.join(scan_dir, os.path.basename(path) or "snippet.txt")
+    with open(scan_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(contents) + "\n")
+    potential = list(scan.scan_file(scan_path))
 
     best: dict[int, str] = {}
     for secret in potential:
@@ -217,6 +223,12 @@ def _placeholder_for(secret_type: str, content: str) -> str:
 def _mask_line(content: str, placeholder: str, secret_type: str) -> str:
     """Replace the credential on `content` with `placeholder`.
 
+    The whole enclosing literal goes, not the value the detector reported, because several
+    detectors report a *truncated* one — `GitHubTokenDetector` returns `ghp` for
+    `ghp_16C7e42F...`, `StripeDetector` drops the last few characters. Substituting only
+    what was reported would leave the rest of the credential in the prompt, breaking
+    invariant 7. Where there is no literal, the value after the assignment operator goes.
+
     A private key line is replaced wholesale: PEM bodies are unquoted, span many lines, and
     there is no safe substring to keep.
     """
@@ -231,7 +243,8 @@ def _mask_line(content: str, placeholder: str, secret_type: str) -> str:
         result = content
         for match in reversed(quoted):
             quote = match.group(1)
-            result = result[: match.start()] + f"{quote}{placeholder}{quote}" + result[match.end() :]
+            masked = f"{quote}{placeholder}{quote}"
+            result = result[: match.start()] + masked + result[match.end() :]
         return result
 
     return _mask_bare_token(content, placeholder)
@@ -244,6 +257,15 @@ def _mask_bare_token(content: str, placeholder: str) -> str:
         return content[: match.end()] + placeholder
     indent = content[: len(content) - len(content.lstrip())]
     return f"{indent}{placeholder}"
+
+
+def _article(word: str) -> str:
+    """"A"/"An" for the detector name that opens the risk sentence.
+
+    The detector names are a fixed, known set (`_PLACEHOLDER_BY_TYPE`), so the vowel test is
+    sufficient — no name in it starts with a silent or consonant-sounding vowel.
+    """
+    return "An" if word[:1].upper() in "AEIOU" else "A"
 
 
 def _assigned_name(content: str) -> str | None:
@@ -264,15 +286,15 @@ def _finding(path: str, line: DiffLine, secret_type: str, placeholder: str, sign
         confidence=_CONFIDENCE_BY_TYPE.get(secret_type, "medium"),
         evidence=f"`{name}` assigned a literal value at {where} (masked as {placeholder})",
         risk=(
-            f"A {secret_type} literal was added under a {signal} path. Anything committed to "
-            "history should be treated as disclosed to everyone with repository access, "
-            "including via forks and clones."
+            f"{_article(secret_type)} {secret_type} literal was added under a {signal} path. "
+            "Anything committed to history should be treated as disclosed to everyone with "
+            "repository access, including via forks and clones."
         ),
         recommendation=(
             "Move the value to an environment variable or secret store, and rotate the "
             "credential — the tool masks the value before review and so cannot confirm "
             "whether it is live."
         ),
-        source="deterministic",
-        rule_id=RULE_ID,
+        source = "deterministic", # type: ignore
+        rule_id = RULE_ID, # type: ignore
     )

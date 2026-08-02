@@ -137,13 +137,22 @@ def test_recommendation_always_mentions_rotation() -> None:
     assert "rotate" in result.findings[0].recommendation.lower()
 
 
-def test_only_added_lines_are_scanned() -> None:
-    """A secret on a removed line was already in the repo; this PR did not introduce it."""
+def test_removed_line_secret_is_masked_but_not_reported() -> None:
+    """A secret on a removed line was already in the repo, so this PR did not introduce it
+    and it earns no finding. It is still *masked*, because removed lines are quoted
+    downstream — in the prompt and in `auth_perms` evidence — and invariant 7 has no
+    added-lines-only qualifier."""
     diff = build_diff(
-        "src/app/config.py", removed=['KEY = "AKIAIOSFODNN7EXAMPLE"'], added=["KEY = os.environ['K']"]
+        "src/app/config.py",
+        removed=['KEY = "AKIAIOSFODNN7EXAMPLE"'],
+        added=["KEY = os.environ['K']"],
     )
     result = mask_diff(diff)
+
     assert result.findings == []
+    removed = diff.files[0].removed_lines[0].content
+    assert "AKIAIOSFODNN7EXAMPLE" not in removed
+    assert "[MASKED_" in removed
 
 
 def test_clean_but_suspicious_produces_no_secret_findings() -> None:
@@ -176,3 +185,61 @@ def test_binary_files_are_skipped() -> None:
     diff = parse_diff((TEST_DIFFS / "binary_file.diff").read_text())
     result = mask_diff(diff)
     assert result.findings == []
+
+
+# ------------------------------------------------------------------------------------
+# Cost of the stage
+# ------------------------------------------------------------------------------------
+
+
+def test_plugin_settings_are_configured_once_per_diff(monkeypatch) -> None:
+    """Entering `transient_settings` rebuilds every plugin and busts detect-secrets'
+    caches, which profiles at roughly half of this stage. It is therefore entered once per
+    diff, not once per file.
+
+    Asserted structurally rather than by wall clock: a timing threshold on a shared CI
+    runner is a flaky test, while the call count is exactly the property that was fixed.
+    """
+    from review_bot import secret_masker
+
+    calls = 0
+    original = secret_masker.transient_settings
+
+    def counting(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(secret_masker, "transient_settings", counting)
+
+    diff = _multi_file_diff(6)
+    result = mask_diff(diff)
+
+    assert len(result.findings) == 6, "every file is still scanned"
+    assert calls == 1, f"configured {calls} times for a 6-file diff; expected once"
+
+
+def test_same_basename_in_two_directories_is_scanned_separately() -> None:
+    """The shared temp directory nests by path digest, so these cannot overwrite each
+    other's scan input."""
+    diff = _multi_file_diff(2, paths=["src/a/config.py", "src/b/config.py"])
+    result = mask_diff(diff)
+
+    assert {f.file for f in result.findings} == {"src/a/config.py", "src/b/config.py"}
+
+
+def _multi_file_diff(count: int, paths: list[str] | None = None):
+    """A diff with `count` distinct files, each carrying one AWS key."""
+    from review_bot.diff_parser import parse_diff
+
+    paths = paths or [f"src/app/mod{i}.py" for i in range(count)]
+    chunks = []
+    for path in paths:
+        chunks.append(
+            f"diff --git a/{path} b/{path}\n"
+            f"index 1111111..2222222 100644\n"
+            f"--- a/{path}\n+++ b/{path}\n"
+            f"@@ -1,1 +1,2 @@\n # context\n"
+            f'+KEY = "AKIAIOSFODNN7EXAMPLE"\n'
+        )
+    return parse_diff("".join(chunks))

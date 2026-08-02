@@ -1,0 +1,7 @@
+```json
+{
+  "summary": "The PR removes authentication and authorization checks from the admin panel while adding a new admin route without confirmed protection. Specifically, `@login_required` and an `is_admin` permission check were removed from `admin.py`, and a new `admin_raw` route was added to `urls.py`. These changes together create a high-risk window where unauthenticated users may access privileged admin functionality.",
+  "overall_risk": "high",
+  "pr_comment": "This PR requires careful review before merge. **Most critical issue:** the removal of `@login_required` and `is_admin` checks in `src/app/views/admin.py` (lines 7–9) appears to expose the admin panel to unauthenticated access, potentially via an `?internal` query parameter bypass. At the same time, a new `admin_raw` route is being added to `urls.py` without visible confirmation that it enforces the same checks.\n\nPlease clarify:\n1. Why were the auth checks removed from the admin view? Did they move to middleware or a different decorator?\n2. Does the new `admin_raw` route have authentication and authorization enforcement? If so, where are those checks applied?\n3. If an `?internal` parameter is intended as a workaround, it must be gated by secure server-side validation, not client-controlled logic.\n\nWithout these answers, this change introduces a privilege-escalation risk. The automated review flagged this as high-severity; please confirm the intent before proceeding."
+}
+```

@@ -28,3 +28,8 @@ packages = ["src/review_bot"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
+# E501 is not in ruff's default set, so `line-length` above was documentation rather than
+# a rule — several lines had drifted past it. Selecting it makes the declared width real.
+extend-select = ["E501"]
