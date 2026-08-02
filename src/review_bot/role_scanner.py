@@ -8,10 +8,15 @@ Two tiers, and the difference is the whole design:
 
 * **Tier 1** is high precision and *suppresses* LLM review of that `(file, line)`. A false
   positive here silently blinds the tool on that line, so these rules match only things
-  whose identity is unambiguous.
-* **Tier 2** is signal with ambiguous intent. Emitted at `confidence: low`, it does **not**
-  suppress — the model reviews the line independently, and §12 promotes both to `high` if
-  they agree.
+  whose identity is unambiguous. Telling the model to confirm a certainty buys nothing.
+* **Tier 2** is signal with ambiguous intent. Emitted at `confidence: low` (or `medium` for
+  the prompt-injection guard), it does **not** suppress and is **not** withheld either: it
+  is handed to the model as a *candidate* — `prompt_builder.build_review_prompt`'s
+  `candidates` argument — with the instruction to confirm or reject it independently, not
+  to take the flag as evidence (§8, §12). Agreement promotes confidence to `high`; the
+  model missing it or disagreeing leaves the Tier 2 finding exactly as it would have been
+  with no LLM involved at all — the network dependency runs one way, toward *more*
+  confidence, never toward a finding's existence.
 
 Most rules are rows in `_ADDED_LINE_RULES`; adding one is a row plus a case in
 `test_role_scanner.py`. The two that cannot be rows read something other than a single
@@ -362,15 +367,20 @@ _ADDED_LINE_RULES: tuple[_Rule, ...] = (
 
 @dataclass
 class ScanResult:
-    """Deterministic findings plus the Tier 1 suppression list.
+    """Deterministic findings, the Tier 1 suppression list, and the Tier 2 candidate list.
 
     `suppressed` holds the `(file, line)` pairs `prompt_builder` tells the model to stay
-    away from. Tier 2 hits are **not** included — §8 is explicit that this is suppression,
-    not hinting.
+    away from — Tier 1 only, since a false positive there is certain and revisiting it adds
+    nothing. `candidates` holds the Tier 2 findings themselves: real pattern, ambiguous
+    intent, worth asking the model to confirm rather than either suppressing or staying
+    silent about (§8, §12). A candidate missing its line number (an `auth_perms` hit with no
+    survivor to anchor to) cannot be cited back at a `citable_lines` entry, so it is left out
+    — it still reaches `findings[]`, just without the chance at promotion.
     """
 
     findings: list[Finding] = field(default_factory=list)
     suppressed: set[tuple[str, int]] = field(default_factory=set)
+    candidates: list[Finding] = field(default_factory=list)
 
 
 def scan_diff(diff: ParsedDiff) -> ScanResult:
@@ -435,22 +445,24 @@ def _scan_added_line(
         if detail is None:
             continue
 
-        result.findings.append(
-            _finding(
-                parsed_file.path,
-                line,
-                category=rule.category,
-                severity=rule.severity,
-                confidence=rule.confidence,
-                rule_id=rule.rule_id,
-                evidence=f"{detail}: `{line.content.strip()}`",
-                risk=rule.risk,
-                recommendation=rule.recommendation,
-            )
+        found = _finding(
+            parsed_file.path,
+            line,
+            category=rule.category,
+            severity=rule.severity,
+            confidence=rule.confidence,
+            rule_id=rule.rule_id,
+            evidence=f"{detail}: `{line.content.strip()}`",
+            risk=rule.risk,
+            recommendation=rule.recommendation,
         )
-        # Only Tier 1 suppresses the model's review of this line (§6, §8).
+        result.findings.append(found)
         if rule.tier == 1 and line.line_no is not None:
+            # Certain, so the model is told to stay away rather than asked to weigh in.
             result.suppressed.add((parsed_file.path, line.line_no))
+        elif rule.tier == 2 and line.line_no is not None:
+            # Ambiguous, so the model is asked to weigh in rather than told anything (§8).
+            result.candidates.append(found)
 
 
 def _scan_removed_line(
@@ -464,32 +476,37 @@ def _scan_removed_line(
 
     anchor = _anchor_line_no(hunk, index)
     where = f"removed at old line {line.source_line_no}"
-    result.findings.append(
-        Finding(
-            file=parsed_file.path,
-            # Removed lines have no post-image line number. The anchor is the nearest
-            # surviving line so the reviewer can navigate; None degrades to a file-level
-            # finding (§11).
-            line=anchor,
-            category="auth_perms",
-            severity="high",
-            confidence="low",
-            evidence=(
-                f"Authorisation check {', '.join(f'`{m}`' for m in matched)} was "
-                f"{where}: `{content.strip()}`"
-            ),
-            risk=(
-                "Removing an authorisation check widens who can reach the surrounding code. "
-                "If the check was load-bearing, this is a privilege-escalation path."
-            ),
-            recommendation=(
-                "Confirm in the PR that the check moved somewhere else — middleware, a "
-                "decorator, or the caller — rather than being dropped."
-            ),
-            source="deterministic",
-            rule_id="auth.removed_check",
-        )
+    found = Finding(
+        file=parsed_file.path,
+        # Removed lines have no post-image line number. The anchor is the nearest
+        # surviving line so the reviewer can navigate; None degrades to a file-level
+        # finding (§11).
+        line=anchor,
+        category="auth_perms",
+        severity="high",
+        confidence="low",
+        evidence=(
+            f"Authorisation check {', '.join(f'`{m}`' for m in matched)} was "
+            f"{where}: `{content.strip()}`"
+        ),
+        risk=(
+            "Removing an authorisation check widens who can reach the surrounding code. "
+            "If the check was load-bearing, this is a privilege-escalation path."
+        ),
+        recommendation=(
+            "Confirm in the PR that the check moved somewhere else — middleware, a "
+            "decorator, or the caller — rather than being dropped."
+        ),
+        source="deterministic",
+        rule_id="auth.removed_check",
     )
+    result.findings.append(found)
+    # A candidate's line has to be one the model can cite back, i.e. an *added* line.
+    # `_anchor_line_no` also matches unchanged context lines — real line numbers, but not
+    # in `citable_lines` — and citing one of those would just get stripped to `null` at
+    # validation, breaking the exact (file, line, category) match promotion needs.
+    if anchor is not None and any(added.line_no == anchor for added in hunk.added_lines):
+        result.candidates.append(found)
 
 
 # --------------------------------------------------------------------------------------

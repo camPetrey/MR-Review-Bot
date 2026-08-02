@@ -492,3 +492,175 @@ def test_record_stem_names_stdin_runs() -> None:
     """A piped diff has no filename; CI pipes `git diff` in, so it still needs a stem."""
     assert cli._record_stem("-") == "stdin"
     assert cli._record_stem("sample_diffs/auth_bypass.diff") == "auth_bypass"
+
+
+# ------------------------------------------------------------------------------------
+# GitHub pull-request input (§23)
+# ------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_pr(monkeypatch):
+    """Stub the GitHub fetch. `github_source` has its own tests; this is the CLI wiring."""
+    def install(diff_text: str, *, error: Exception | None = None):
+        fetched: list = []
+
+        def _diff(ref, **kwargs):
+            fetched.append(ref)
+            if error is not None:
+                raise error
+            return diff_text
+
+        monkeypatch.setattr(cli, "fetch_pr_diff", _diff)
+        monkeypatch.setattr(
+            cli,
+            "fetch_pr_info",
+            lambda ref, **kwargs: cli.PullRequestInfo(ref=ref, title="A real PR", author="octocat"),
+        )
+        return fetched
+
+    return install
+
+
+def test_pr_flag_reviews_the_fetched_diff(capsys, fake_llm, fake_pr) -> None:
+    fake_llm(review_json(), summary_json())
+    fetched = fake_pr((SAMPLE_DIFFS / "auth_bypass.diff").read_text())
+
+    code, payload, _ = run(["--pr", "psf/requests#7328"], capsys)
+
+    assert code == 0
+    assert payload["findings"]
+    assert (fetched[0].owner, fetched[0].repo, fetched[0].number) == ("psf", "requests", 7328)
+
+
+def test_a_pr_url_works_as_the_positional_argument(capsys, fake_llm, fake_pr) -> None:
+    """Pasting a PR URL is what someone actually does, so the positional accepts one."""
+    fake_llm(review_json(), summary_json())
+    fetched = fake_pr((SAMPLE_DIFFS / "auth_bypass.diff").read_text())
+
+    code, _, _ = run(["https://github.com/psf/requests/pull/7328"], capsys)
+
+    assert code == 0
+    assert fetched[0].number == 7328
+
+
+def test_an_existing_file_always_wins_over_a_pr_shaped_name(capsys, fake_llm, tmp_path) -> None:
+    """A file that exists is read as a file, whatever its name looks like."""
+    fake_llm(review_json(), summary_json())
+    path = tmp_path / "owner-repo-1.diff"
+    path.write_text((SAMPLE_DIFFS / "auth_bypass.diff").read_text())
+
+    code, payload, _ = run([str(path)], capsys)
+    assert code == 0
+    assert payload["findings"]
+
+
+def test_a_bare_number_is_not_a_pr_in_the_positional_slot(capsys) -> None:
+    """`123` is a valid filename. Only `--pr` makes it unambiguous."""
+    code, _, err = run(["123"], capsys)
+    assert code == cli.EXIT_PARSE_ERROR
+    assert "could not read diff" in err
+
+
+def test_a_failed_fetch_exits_1_like_an_unreadable_diff(capsys, fake_pr) -> None:
+    """§23: a PR that cannot be fetched is unusable input, not a tool failure."""
+    fake_pr("", error=cli.GitHubError("`gh` is not authenticated. Run `gh auth login`"))
+
+    code, _, err = run(["--pr", "psf/requests#7328"], capsys)
+
+    assert code == cli.EXIT_PARSE_ERROR
+    assert "gh auth login" in err
+
+
+def test_pr_and_a_diff_path_together_are_rejected(capsys) -> None:
+    with pytest.raises(SystemExit):
+        cli.main([str(SAMPLE_DIFFS / "auth_bypass.diff"), "--pr", "o/r#1"])
+
+
+def test_no_input_at_all_is_rejected(capsys) -> None:
+    with pytest.raises(SystemExit):
+        cli.main([])
+
+
+def test_a_malformed_pr_reference_is_rejected(capsys) -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["--pr", "not-a-pull-request"])
+
+
+def test_pr_runs_record_to_a_filename_derived_from_the_pr(
+    capsys, monkeypatch, fake_pr, tmp_path
+) -> None:
+    """`owner/repo#123` contains `/` and `#`; neither belongs in a fixture filename."""
+    def fake_send(self, prompt, *, model, max_tokens, effort):
+        return (review_json() if max_tokens == REVIEW_MAX_TOKENS else summary_json(), Usage())
+
+    monkeypatch.setattr(cli.LLMClient, "_send", fake_send)
+    fake_pr((SAMPLE_DIFFS / "auth_bypass.diff").read_text())
+    run(["--pr", "psf/requests#7328", "--record", str(tmp_path)], capsys)
+
+    assert sorted(p.name for p in tmp_path.glob("*.json")) == [
+        "review-pr-psf-requests-7328.json",
+        "summary-pr-psf-requests-7328.json",
+    ]
+
+
+# ------------------------------------------------------------------------------------
+# Output format (§24)
+# ------------------------------------------------------------------------------------
+
+
+def test_auto_format_is_markdown_when_stdout_is_not_a_terminal(capsys, fake_llm) -> None:
+    """§18's workflows and every existing `>` and `| less` depend on this staying true."""
+    fake_llm(review_json(), summary_json())
+    code = cli.main([str(SAMPLE_DIFFS / "auth_bypass.diff")])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert out.startswith("# Security review")
+
+
+def test_auto_format_is_terminal_when_stdout_is_a_terminal(capsys, fake_llm, monkeypatch) -> None:
+    fake_llm(review_json(), summary_json())
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True, raising=False)
+
+    cli.main([str(SAMPLE_DIFFS / "auth_bypass.diff")])
+    out = capsys.readouterr().out
+
+    assert "Security review" in out
+    assert not out.startswith("# Security review"), "should be the styled report, not Markdown"
+
+
+def test_terminal_format_writes_a_file_when_asked(capsys, fake_llm, tmp_path) -> None:
+    fake_llm(review_json(), summary_json())
+    out_path = tmp_path / "review.txt"
+    cli.main(
+        [str(SAMPLE_DIFFS / "auth_bypass.diff"), "--format", "terminal", "--output", str(out_path)]
+    )
+
+    written = out_path.read_text()
+    assert "Security review" in written
+    assert all(line == line.rstrip() for line in written.splitlines())
+
+
+def test_terminal_format_never_leaks_a_raw_secret(capsys, fake_llm) -> None:
+    """Invariant 7, through the styled renderer as well as the Markdown one."""
+    fake_llm(review_json(), summary_json())
+    cli.main([str(SAMPLE_DIFFS / "secrets_and_logging.diff"), "--format", "terminal"])
+    out = capsys.readouterr().out
+
+    assert "AKIAIOSFODNN7EXAMPLE" not in out
+    assert "[MASKED_" in out
+
+
+def test_verbose_diagnostics_precede_the_terminal_report(capsys, fake_llm) -> None:
+    """stderr is flushed before stdout so counters do not interleave with the boxes.
+
+    `_render` builds the terminal report and `_write` prints it, and this is the behaviour
+    that split exists for — a regression would put `timings:` in the middle of a panel.
+    """
+    fake_llm(review_json(), summary_json())
+    cli.main([str(SAMPLE_DIFFS / "auth_bypass.diff"), "--format", "terminal", "--verbose"])
+    captured = capsys.readouterr()
+
+    assert "render" in captured.err, "the render stage must still be timed"
+    assert "Security review" in captured.out

@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from conftest import build_diff, load
+from conftest import REAL_DIFFS, build_diff, load
 
 from review_bot.diff_parser import parse_diff
 from review_bot.prompt_builder import (
@@ -23,6 +23,7 @@ from review_bot.prompt_builder import (
     FileBlock,
     build_review_prompt,
     build_summary_prompt,
+    content_budget,
     estimate_tokens,
     filter_files,
     pack,
@@ -229,23 +230,30 @@ def test_suppression_list_names_only_files_in_this_batch() -> None:
     diff = build_diff("src/a.py", added=["a = 1"])
     prompt = build_review_prompt(pack(diff.files)[0], {("src/elsewhere.py", 7)})
     assert "src/elsewhere.py" not in prompt.user
-    assert "Suppression list: none." in prompt.user
+    assert "Suppressed: none." in prompt.user
 
 
-def test_tier2_hits_are_not_in_the_prompt() -> None:
-    """§8/§12: suppression, not hinting. Only Tier 1 pairs reach the model, and they are
-    told to stay away rather than invited to confirm."""
+def test_tier2_hits_reach_the_prompt_as_candidates_not_suppressions() -> None:
+    """§8/§12: Tier 2 is a candidate to confirm, not a suppression and not silence. Only
+    Tier 1 pairs land in the suppression list; Tier 2 findings land in the candidate list,
+    named explicitly so the model is asked to verify rather than told to stay away."""
     from review_bot.role_scanner import scan_diff
 
     diff = load("injection_and_logging.diff")
     scan = scan_diff(diff)
     assert scan.findings, "this sample should produce Tier 2 hits"
     assert scan.suppressed == set(), "these are Tier 2 — nothing to suppress"
+    assert scan.candidates, "Tier 2 hits should be offered as candidates"
 
-    prompt = build_review_prompt(pack(diff.files)[0], scan.suppressed)
-    assert "Suppression list: none." in prompt.user
-    for finding in scan.findings:
-        assert finding.evidence not in prompt.user, "a Tier 2 hit leaked into the prompt as a hint"
+    prompt = build_review_prompt(pack(diff.files)[0], scan.suppressed, scan.candidates)
+    assert "Suppressed: none." in prompt.user
+    assert "Candidates" in prompt.user
+    for finding in scan.candidates:
+        # `finding.evidence` reaches the prompt JSON-encoded, so its quotes are escaped —
+        # compare against the same encoding rather than the raw string.
+        assert json.dumps(finding.evidence)[1:-1] in prompt.user, (
+            "a Tier 2 candidate should reach the prompt"
+        )
 
 
 def test_system_prompt_has_no_interpolation_points() -> None:
@@ -264,7 +272,7 @@ def test_system_prompt_clears_the_cache_minimum() -> None:
 def test_system_prompt_forbids_the_deterministic_only_category() -> None:
     """§5: the LLM never reports `hardcoded_secrets` and is instructed not to."""
     assert "hardcoded_secrets" in REVIEW_SYSTEM_PROMPT
-    assert "Do NOT report `hardcoded_secrets`" in REVIEW_SYSTEM_PROMPT
+    assert "Do not report `hardcoded_secrets`" in REVIEW_SYSTEM_PROMPT
 
 
 def test_summary_prompt_never_contains_the_diff() -> None:
@@ -340,3 +348,59 @@ def test_masked_placeholders_reach_the_prompt_and_raw_values_do_not() -> None:
     assert "[MASKED_" in prompt.user
     for raw in ("AKIAIOSFODNN7EXAMPLE", "hunter2-not-real"):
         assert raw not in prompt.user
+
+
+# ------------------------------------------------------------------------------------
+# Packing budgets the whole request, not just the file content (§7, §22)
+# ------------------------------------------------------------------------------------
+
+
+def test_a_packed_batch_fits_the_input_budget_with_its_system_prompt() -> None:
+    """The bug `real_diffs/large_multi_file.diff` exposed, in one assertion.
+
+    `--max-input-tokens` limits the whole request, which is what `llm_client.preflight`
+    measures. Packing to that number using file content alone fills a batch to the limit and
+    then adds a ~1,600-token system prompt on top, so every full batch aborts at exit 3
+    before sending anything. Nothing caught it because the five sample diffs never fill a
+    batch (§22).
+    """
+    diff = parse_diff((REAL_DIFFS / "large_multi_file.diff").read_text())
+    batches = pack(filter_files(diff).reviewable, 8000)
+
+    assert len(batches) > 1, "the fixture must actually pack more than one batch to test this"
+    for batch in batches:
+        assert build_review_prompt(batch, set()).token_estimate <= 8000
+
+
+@pytest.mark.parametrize("limit", [2000, 4000, 8000, 16000])
+def test_packing_fits_the_budget_at_every_limit(limit) -> None:
+    """As above, across limits.
+
+    The single-block escape is §7's own rule, not a loophole: a file is only split when it
+    exceeds the budget alone, and a hunk that is *still* oversized after splitting has
+    nowhere left to go. Such a call is refused by `preflight`, which is the correct place —
+    the fix is a larger `--max-input-tokens`, and silently dropping the file would be worse.
+    """
+    diff = parse_diff((REAL_DIFFS / "large_multi_file.diff").read_text())
+    for batch in pack(filter_files(diff).reviewable, limit):
+        prompt = build_review_prompt(batch, set())
+        assert prompt.token_estimate <= limit or len(batch.blocks) == 1
+
+
+def test_content_budget_reserves_at_least_the_system_prompt() -> None:
+    """The reserve is measured from an empty prompt, so it covers the wrapper too."""
+    assert content_budget(8000) <= 8000 - estimate_tokens(REVIEW_SYSTEM_PROMPT)
+    assert content_budget(8000) > 0
+
+
+def test_content_budget_never_goes_to_zero_or_over_the_limit() -> None:
+    """A tiny limit must still make progress; `preflight` is what refuses to send it.
+
+    It must also never exceed the caller's own limit — a floor that did would be the
+    opposite of a budget.
+    """
+    for limit in (1, 10, 100, 2000, 8000):
+        assert 0 < content_budget(limit) <= limit
+
+    diff = parse_diff((REAL_DIFFS / "large_multi_file.diff").read_text())
+    assert len(pack(filter_files(diff).reviewable, 10)) > 0, "packing must terminate"

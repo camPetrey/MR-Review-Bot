@@ -1,0 +1,26 @@
+diff --git a/requirements/dev.txt b/requirements/dev.txt
+index d66e9669e..b40d75d27 100644
+--- a/requirements/dev.txt
++++ b/requirements/dev.txt
+@@ -135,7 +135,7 @@ typed-ast==1.4.2
+     # via mypy
+ typing-extensions==3.7.4.3
+     # via mypy
+-urllib3==1.26.3
++urllib3==1.26.4
+     # via requests
+ virtualenv==20.3.0
+     # via
+diff --git a/requirements/docs.txt b/requirements/docs.txt
+index ac984e040..97c9f8980 100644
+--- a/requirements/docs.txt
++++ b/requirements/docs.txt
+@@ -60,7 +60,7 @@ sphinxcontrib-qthelp==1.0.3
+     # via sphinx
+ sphinxcontrib-serializinghtml==1.1.4
+     # via sphinx
+-urllib3==1.26.3
++urllib3==1.26.4
+     # via requests
+ 
+ # The following packages are considered to be unsafe in a requirements file:
