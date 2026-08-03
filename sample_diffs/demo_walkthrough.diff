@@ -1,0 +1,36 @@
+diff --git a/app/users.py b/app/users.py
+index 4a1c9de..8f2b71a 100644
+--- a/app/users.py
++++ b/app/users.py
+@@ -14,16 +14,14 @@
+     password = request.form["password"]
+     user = User.query.filter_by(username=username).first()
+     if user is None or not user.check_password(password):
+-        logger.warning("failed login for user=%s", username)
++        logger.warning("failed login for user=%s pass=%s", username, password)
+         return {"error": "invalid credentials"}, 401
+     session["user_id"] = user.id
+-    return redirect("/dashboard")
++    return redirect(request.args.get("next", "/dashboard"))
+
+
+ @bp.route("/users/<int:user_id>", methods=["DELETE"])
+ def delete_user(user_id):
+-    if not session.get("is_admin"):
+-        return {"error": "forbidden"}, 403
+     user = User.query.get_or_404(user_id)
+     db.session.delete(user)
+     db.session.commit()
+@@ -31,4 +29,4 @@
+
+
+ def cache_key(value):
+-    return hashlib.sha256(value.encode()).hexdigest()
++    return hashlib.md5(value.encode()).hexdigest()
+@@ -37,4 +35,5 @@
+ 
+ @bp.route("/users", methods=["GET"])
+ def list_users():
+-    return jsonify([u.to_dict() for u in User.query.limit(50)])
++    limit = int(request.args.get("limit", 50))
++    return jsonify([u.to_dict() for u in User.query.limit(limit)])
