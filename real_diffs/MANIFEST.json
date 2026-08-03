@@ -1,0 +1,90 @@
+{
+  "_comment": [
+    "Provenance for real_diffs/. Every entry is a real, merged, public GitHub pull request,",
+    "fetched as `Accept: application/vnd.github.v3.diff` and committed verbatim.",
+    "These complement sample_diffs/ (SPEC.md §16) rather than replacing them: the samples are",
+    "hand-written to make each rule fire and are what the rules were tuned against, so they",
+    "stay as the tuned canaries. These are what the tool is actually pointed at, and they are",
+    "here to exercise the pipeline paths a 30-line hand-written diff never reaches.",
+    "Refresh with `make refresh-real-diffs`.",
+    "",
+    "`exercises` is what each diff is kept FOR — asserted in tests/test_real_diffs.py.",
+    "`deterministic_findings` is what the deterministic layer actually produces, measured,",
+    "not hoped for. Most real PRs produce zero; that is the honest number and SPEC.md §25",
+    "says why it is the expected one."
+  ],
+  "fetched": "2026-08-02",
+  "diffs": [
+    {
+      "file": "dependency_bump.diff",
+      "repo": "pallets/werkzeug",
+      "pr": 2080,
+      "url": "https://github.com/pallets/werkzeug/pull/2080",
+      "title": "[Security] Bump urllib3 from 1.26.3 to 1.26.4",
+      "exercises": [
+        "Tier 1 dependency_change on a real lockfile (§6)",
+        "the lockfile filter: every file excluded, zero reviewable (§7)",
+        "invariant 6 — a fully-filtered diff makes no API call at all"
+      ],
+      "deterministic_findings": 2
+    },
+    {
+      "file": "large_multi_file.diff",
+      "repo": "encode/httpx",
+      "pr": 2879,
+      "url": "https://github.com/encode/httpx/pull/2879",
+      "title": "Proxy API rework",
+      "exercises": [
+        "multi-batch bin-packing: ~13k estimated tokens against the 8k default (§7)",
+        "11 files in one diff, which no sample_diff reaches",
+        "a real detect-secrets hit, and a real false positive with it — see notes"
+      ],
+      "deterministic_findings": 2,
+      "notes": [
+        "The two hardcoded_secrets findings are on `docs/advanced.md`, where the changed lines",
+        "are documentation examples showing `http://user:pass@proxy` URLs. detect-secrets is",
+        "right that the line contains credential-shaped text and wrong that it matters, and",
+        "the path heuristic scores it `high` because `docs/` is not `tests/`.",
+        "This is SPEC.md §21 limitation 2 caught on real input rather than argued in prose,",
+        "and it is the single most useful thing in this directory. Kept deliberately."
+      ]
+    },
+    {
+      "file": "debugger_pin_fix.diff",
+      "repo": "pallets/werkzeug",
+      "pr": 3078,
+      "url": "https://github.com/pallets/werkzeug/pull/3078",
+      "title": "initialize `_pin` in debugger",
+      "exercises": [
+        "a genuine security fix in security-relevant code (debugger PIN auth)",
+        "an ordinary multi-file Python PR with tests and a changelog",
+        "zero deterministic findings on code that is entirely about authentication"
+      ],
+      "deterministic_findings": 0
+    },
+    {
+      "file": "redirect_history.diff",
+      "repo": "psf/requests",
+      "pr": 7328,
+      "url": "https://github.com/psf/requests/pull/7328",
+      "title": "Prevent Response self-reference in redirect history",
+      "exercises": [
+        "redirect-handling code that does NOT trip the unsafe_redirects rule (§6 Tier 2)",
+        "a false-positive check on real code, the way clean_but_suspicious.diff does on written code"
+      ],
+      "deterministic_findings": 0
+    },
+    {
+      "file": "docs_removal.diff",
+      "repo": "pallets/flask",
+      "pr": 5695,
+      "url": "https://github.com/pallets/flask/pull/5695",
+      "title": "Remove HTTP Public Key Pinning from docs",
+      "exercises": [
+        "a pure-deletion diff: no added lines anywhere",
+        "the §15 exit-0 path — `No reviewable changes.`, valid JSON, no API call"
+      ],
+      "deterministic_findings": 0
+    }
+  ]
+}

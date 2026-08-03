@@ -15,6 +15,8 @@ import pytest
 from review_bot.diff_parser import ParsedDiff, parse_diff
 
 SAMPLE_DIFFS = Path(__file__).parent.parent / "sample_diffs"
+REAL_DIFFS = Path(__file__).parent.parent / "real_diffs"
+"""Real merged public PRs (§25). See `tests/test_real_diffs.py`."""
 TEST_DIFFS = Path(__file__).parent / "diffs"
 FIXTURES = Path(__file__).parent / "fixtures"
 

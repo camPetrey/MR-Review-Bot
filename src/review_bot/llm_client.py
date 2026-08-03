@@ -73,7 +73,7 @@ class BudgetExceeded(Exception):
 
 @dataclass
 class Usage:
-    """One call's token accounting, logged to stderr under `--verbose` (§9)."""
+    """One call's token accounting, reported to stderr under `--verbose` (§9)."""
 
     input_tokens: int = 0
     output_tokens: int = 0
@@ -88,6 +88,31 @@ class Usage:
             + self.cache_creation_input_tokens * rate_in * _CACHE_WRITE_MULTIPLIER
             + self.output_tokens * rate_out
         ) / 1_000_000
+
+
+@dataclass(frozen=True)
+class CallLog:
+    """What one completed call cost, in tokens, seconds, and dollars.
+
+    Kept as a record rather than logged and discarded, because the two audiences want it in
+    two different shapes: the live line wants "is it still running and what has it cost so
+    far", the end-of-run report wants every call side by side in one aligned table. Building
+    the second from a re-read of the first would mean parsing our own log output.
+    """
+
+    label: str
+    model: str
+    seconds: float
+    usage: Usage
+
+    @property
+    def cost(self) -> float:
+        return self.usage.cost(self.model)
+
+    @property
+    def cache_tokens(self) -> int:
+        """Prompt-cache traffic in one number. Reads dominate; writes happen once per prefix."""
+        return self.usage.cache_read_input_tokens + self.usage.cache_creation_input_tokens
 
 
 def _rates(model: str) -> tuple[float, float]:
@@ -175,7 +200,7 @@ class LLMClient:
     record_dir: Path | None = None
 
     spent: float = field(default=0.0, init=False)
-    usages: list[tuple[str, Usage]] = field(default_factory=list, init=False)
+    calls: list[CallLog] = field(default_factory=list, init=False)
     _client: object | None = field(default=None, init=False, repr=False)
 
     # -- public API ---------------------------------------------------------------------
@@ -245,12 +270,17 @@ class LLMClient:
         return "\n".join(lines)
 
     def usage_summary(self) -> str:
-        """One line per call plus the run total, for stderr (§9)."""
+        """One line per call plus the run total, for a log nobody is reading live (§9).
+
+        The plain-text form. On a terminal the same numbers go through
+        `terminal.render_diagnostics` instead, which can align them into columns; this is
+        what a CI log and a redirected stderr get, and it stays grep-able key=value.
+        """
         lines = [
-            f"{label}: in={u.input_tokens} out={u.output_tokens} "
-            f"cache_read={u.cache_read_input_tokens} "
-            f"cache_write={u.cache_creation_input_tokens}"
-            for label, u in self.usages
+            f"{call.label}: in={call.usage.input_tokens} out={call.usage.output_tokens} "
+            f"cache_read={call.usage.cache_read_input_tokens} "
+            f"cache_write={call.usage.cache_creation_input_tokens}"
+            for call in self.calls
         ]
         lines.append(f"total cost this run: ${self.spent:.4f}")
         return "\n".join(lines)
@@ -265,7 +295,7 @@ class LLMClient:
         if self.cache is not None:
             cached = self.cache.get(key)
             if cached is not None:
-                self._log(f"[{label}] cache hit ({key[:12]}) — no API call")
+                self._log(f"  · {label}  cache hit ({key[:12]})  no API call")
                 self._record(label, cached)
                 return cached
 
@@ -275,14 +305,13 @@ class LLMClient:
         text, usage = self._send(prompt, model=model, max_tokens=max_tokens, effort=effort)
         elapsed = time.monotonic() - started
 
-        self.spent += usage.cost(model)
-        self.usages.append((label, usage))
-        self._log(
-            f"[{label}] model={model} {elapsed:.1f}s in={usage.input_tokens} "
-            f"out={usage.output_tokens} cache_read={usage.cache_read_input_tokens} "
-            f"cache_write={usage.cache_creation_input_tokens} "
-            f"cost=${usage.cost(model):.4f} run_total=${self.spent:.4f}"
-        )
+        call = CallLog(label=label, model=model, seconds=elapsed, usage=usage)
+        self.spent += call.cost
+        self.calls.append(call)
+        # Deliberately short. This line's job is to prove the run is alive during a ten-second
+        # wait and to say what it has cost so far; the token accounting behind it is reported
+        # once, at the end, where it can be laid out in columns instead of run together.
+        self._log(f"  · {label}  {model}  {elapsed:.1f}s  ${call.cost:.4f}")
 
         if self.cache is not None:
             self.cache.put(key, text)

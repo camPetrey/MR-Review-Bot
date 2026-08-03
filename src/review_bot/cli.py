@@ -16,10 +16,20 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .diff_parser import DiffParseError, ParsedDiff, parse_diff
+from .github_source import (
+    GitHubError,
+    PullRequestInfo,
+    fetch_pr_diff,
+    fetch_pr_info,
+    looks_like_pr_ref,
+    parse_pr_ref,
+)
 from .llm_client import (
     DEFAULT_REVIEW_MODEL,
     DEFAULT_SUMMARY_MODEL,
@@ -53,6 +63,16 @@ from .schema import (
     validate_findings,
 )
 from .secret_masker import mask_diff
+from .terminal import (
+    CallRecord,
+    RunDiagnostics,
+    TerminalContext,
+    build_console,
+    build_stderr_console,
+    prepare_terminal,
+    render_diagnostics,
+    render_terminal_str,
+)
 
 EXIT_OK = 0
 EXIT_PARSE_ERROR = 1
@@ -72,12 +92,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "diff",
-        metavar="DIFF_PATH",
-        help="Path to a unified diff, or '-' to read stdin. No git invocation.",
+        "source",
+        metavar="DIFF_PATH | PR_URL",
+        nargs="?",
+        help="Path to a unified diff, '-' to read stdin, or a GitHub pull request "
+             "(https://github.com/owner/repo/pull/123, or owner/repo#123).",
     )
-    parser.add_argument("--format", choices=["markdown", "json", "both"], default="markdown",
-                        help="Output format. JSON is the source of truth either way.")
+    parser.add_argument("--pr", metavar="REF",
+                        help="Review a GitHub pull request. Accepts a URL, owner/repo#123, "
+                             "or a bare 123 for the current repository. Fetched with `gh`.")
+    parser.add_argument("--format", choices=["auto", "terminal", "markdown", "json", "both"],
+                        default="auto",
+                        help="Output format. 'auto' (default) is terminal when stdout is a "
+                             "TTY and markdown when it is piped. JSON is the source of "
+                             "truth either way.")
+    parser.add_argument("--no-color", action="store_true",
+                        help="Disable colour in terminal output. NO_COLOR is honoured too.")
     parser.add_argument("--output", metavar="PATH",
                         help="Write output to a file (default stdout). With --format both, "
                              "Markdown goes to PATH and JSON to PATH with a .json suffix.")
@@ -102,14 +132,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     timings = Timings()
 
     try:
-        with timings("parse"):
-            diff = parse_diff(_read_input(args.diff))
-    except DiffParseError as exc:
-        print(f"error: could not parse diff: {exc}", file=sys.stderr)
+        source = _resolve_source(args, parser)
+    except GitHubError as exc:
+        # A pull request that cannot be fetched is unusable input, exactly like a diff that
+        # cannot be read, so it takes the same exit code (§15, §23).
+        print(f"error: {exc}", file=sys.stderr)
         return EXIT_PARSE_ERROR
     except (OSError, UnicodeDecodeError) as exc:
         # UnicodeDecodeError: a diff file that is not UTF-8 (Latin-1 content is common in
@@ -117,11 +149,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: could not read diff: {exc}", file=sys.stderr)
         return EXIT_PARSE_ERROR
 
+    try:
+        with timings("parse"):
+            diff = parse_diff(source.text)
+    except DiffParseError as exc:
+        print(f"error: could not parse diff: {exc}", file=sys.stderr)
+        return EXIT_PARSE_ERROR
+
     if not diff.has_reviewable_changes:
         # §15: exit 0 with valid JSON and a reason. The LLM is not called — never spend
         # money on an empty diff (invariant 6).
         print("No reviewable changes.", file=sys.stderr)
-        _emit(args, _empty_review("The diff contains no added lines to review."))
+        _emit(args, _empty_review("The diff contains no added lines to review."), source)
         return EXIT_OK
 
     # ---- Deterministic stages. These run before anything reaches the network. ----------
@@ -145,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         # Every file was filtered out. Invariant 6 again: nothing to review, no call.
         print("No files eligible for LLM review; deterministic findings only.", file=sys.stderr)
 
-    stem = _record_stem(args.diff)
+    stem = source.stem
     client = LLMClient(
         model=args.model,
         summary_model=args.summary_model,
@@ -158,13 +197,16 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.dry_run:
-        return _dry_run(args, client, batches, filtered, deterministic, scan_result.suppressed)
+        return _dry_run(
+            args, client, batches, filtered, deterministic, scan_result.suppressed,
+            scan_result.candidates,
+        )
 
     if not skip_llm:
         try:
             with timings("review_pass"):
                 llm_findings, stats = _review_pass(
-                    client, batches, scan_result.suppressed, diff, stem
+                    client, batches, scan_result.suppressed, scan_result.candidates, diff, stem
                 )
         except _LLM_FAILURES as exc:
             if (code := _report_llm_failure(exc, "review pass")) is not None:
@@ -190,8 +232,13 @@ def main(argv: list[str] | None = None) -> int:
 
     review = _assemble(findings, summary, filtered)
     with timings("render"):
-        rendered = _render(args, review, filtered.exclusion_summary())
-    _report_metrics(stats, filtered, client, timings, mask_result, args.verbose)
+        rendered = _render(
+            args, review, filtered.exclusion_summary(), source, partial=summary is None
+        )
+    # Metrics go to stderr before the report goes to stdout: when both land on a terminal,
+    # the diagnostics scroll away above the report instead of interleaving with its boxes.
+    # `_render` only *builds* the terminal report; `_write` is what prints it.
+    _report_metrics(args, stats, filtered, client, timings, mask_result, source)
     _write(args, rendered)
 
     if args.fail_on == "high" and any(f.severity == "high" for f in review.findings):
@@ -233,6 +280,7 @@ def _review_pass(
     client: LLMClient,
     batches: list,
     suppressed: set[tuple[str, int]],
+    candidates: list[Finding],
     diff: ParsedDiff,
     stem: str,
 ) -> tuple[list[Finding], ValidationStats]:
@@ -250,7 +298,9 @@ def _review_pass(
         # common single-batch run records to `review-<stem>.json` — the fixture name the
         # contract test reads. See `_record_stem`.
         suffix = f"-{index}" if len(batches) > 1 else ""
-        raw = client.review(build_review_prompt(batch, suppressed), label=f"review-{stem}{suffix}")
+        raw = client.review(
+            build_review_prompt(batch, suppressed, candidates), label=f"review-{stem}{suffix}"
+        )
         validated, batch_stats = validate_findings(parse_review_response(raw), diff)
         collected.extend(apply_confidence_caps(validated, batch))
         stats.extend(batch_stats)
@@ -258,7 +308,9 @@ def _review_pass(
     return collected, stats
 
 
-def _dry_run(args, client: LLMClient, batches, filtered, deterministic, suppressed) -> int:
+def _dry_run(
+    args, client: LLMClient, batches, filtered, deterministic, suppressed, candidates
+) -> int:
     """`--dry-run`: build and price every prompt, send nothing (§9).
 
     The summary prompt is built from deterministic findings alone, since the review pass
@@ -266,7 +318,12 @@ def _dry_run(args, client: LLMClient, batches, filtered, deterministic, suppress
     which is what a cost estimate needs.
     """
     calls = [
-        (f"review-{i}", build_review_prompt(b, suppressed), args.model, REVIEW_MAX_TOKENS)
+        (
+            f"review-{i}",
+            build_review_prompt(b, suppressed, candidates),
+            args.model,
+            REVIEW_MAX_TOKENS,
+        )
         for i, b in enumerate(batches)
     ]
     calls.append(
@@ -314,35 +371,58 @@ def _assemble(findings: list[Finding], summary: LLMSummaryResponse | None, filte
 
 
 def _report_metrics(
+    args,
     stats: ValidationStats,
     filtered,
     client: LLMClient,
     timings: Timings,
     mask_result,
-    verbose: bool,
+    source: Source,
 ) -> None:
-    """§11: both counters go to stderr on every run and into the CI job output."""
-    print(
-        f"unmappable_count={stats.unmappable_count} "
-        f"hallucinated_file_count={stats.hallucinated_file_count}",
-        file=sys.stderr,
-    )
-    if note := filtered.exclusion_summary():
-        print(note, file=sys.stderr)
-    if not verbose:
-        return
+    """Collect what the run has to say about itself; `terminal` decides how it looks.
 
-    # Masking is the one stage whose success is invisible in the output: a run that masked
-    # nothing and a run whose masking silently no-opped look identical.
-    print(f"masked_line_count={mask_result.masked_line_count}", file=sys.stderr)
-    print(timings.report(), file=sys.stderr)
-    if client.usages:
-        print(client.usage_summary(), file=sys.stderr)
-    # The specific lines and files behind the counters above — what tuning acts on (§11).
-    if stats.unmappable_lines:
-        print(f"unmappable lines: {stats.unmappable_lines}", file=sys.stderr)
-    if stats.hallucinated_files:
-        print(f"hallucinated files: {stats.hallucinated_files}", file=sys.stderr)
+    §11: both counters go to stderr on every run and into the CI job output — which is why
+    this is unconditional and only the detail behind it is gated on `--verbose`. Masking is
+    in that detail because it is the one stage whose success is invisible in the output: a
+    run that masked nothing and a run whose masking silently no-opped look identical.
+    """
+    render_diagnostics(
+        RunDiagnostics(
+            unmappable_count=stats.unmappable_count,
+            hallucinated_file_count=stats.hallucinated_file_count,
+            excluded_note=filtered.exclusion_summary(),
+            source_label=source.label,
+            verbose=args.verbose,
+            masked_line_count=mask_result.masked_line_count,
+            calls=tuple(
+                CallRecord(
+                    label=_call_label(call.label, source.stem),
+                    model=call.model,
+                    seconds=call.seconds,
+                    input_tokens=call.usage.input_tokens,
+                    output_tokens=call.usage.output_tokens,
+                    cache_tokens=call.cache_tokens,
+                    cost=call.cost,
+                )
+                for call in client.calls
+            ),
+            total_cost=client.spent,
+            stages=timings.stages,
+            unmappable_lines=tuple(str(line) for line in stats.unmappable_lines),
+            hallucinated_files=tuple(stats.hallucinated_files),
+        ),
+        console=build_stderr_console(no_color=args.no_color),
+    )
+
+
+def _call_label(label: str, stem: str) -> str:
+    """`review-auth_bypass` -> `review`, once the table has a heading naming the source.
+
+    The stem is in the call label because `--record` names fixture files with it (§17), and
+    repeating it on every row of a table that already says which diff it reviewed is the
+    kind of redundancy that made the old block unreadable.
+    """
+    return label.removesuffix(f"-{stem}") or label
 
 
 # --------------------------------------------------------------------------------------
@@ -350,11 +430,94 @@ def _report_metrics(
 # --------------------------------------------------------------------------------------
 
 
+@dataclass
+class Source:
+    """Where the diff came from, and how the run should label it.
+
+    One object rather than three parallel variables because every consumer wants a
+    different part of it: `parse_diff` wants the text, `--record` wants the stem, the
+    terminal header wants the pull request. Bundling them keeps `main` from threading three
+    arguments through calls that only use one.
+    """
+
+    text: str
+    stem: str
+    """`--record` / `--verbose` call label, derived from the input (see below)."""
+    label: str = ""
+    pr: PullRequestInfo | None = None
+
+    def terminal_context(self, *, partial: bool) -> TerminalContext:
+        if self.pr is None:
+            return TerminalContext(source_label=self.label, partial=partial)
+        return TerminalContext(
+            pr_label=self.pr.label,
+            pr_title=self.pr.title,
+            pr_author=self.pr.author,
+            pr_base=self.pr.base,
+            pr_head=self.pr.head,
+            partial=partial,
+        )
+
+
+def _resolve_source(args, parser: argparse.ArgumentParser) -> Source:
+    """Turn the arguments into diff text plus the labels the run needs (§14, §23).
+
+    The positional slot accepts a path *or* a pull request, which is the whole ergonomic
+    point of `--pr` being optional — pasting a PR URL is what someone actually does. That is
+    safe only because `looks_like_pr_ref` rejects the bare-number forms: a URL and
+    `owner/repo#123` cannot be mistaken for a real path, and `123` can.
+
+    An existing file always wins over a reference that looks like a PR, so a directory
+    genuinely containing `owner/repo#1` still reads as the file it is.
+    """
+    if args.pr and args.source:
+        parser.error("give a diff path or --pr, not both")
+    if not args.pr and not args.source:
+        parser.error("a diff path, '-' for stdin, or --pr is required")
+
+    if args.pr:
+        ref = parse_pr_ref(args.pr, allow_bare=True)
+        if ref is None:
+            parser.error(
+                f"--pr {args.pr!r} is not a pull request reference. Expected a URL, "
+                "owner/repo#123, or a bare number."
+            )
+        return _fetch_source(ref)
+
+    source: str = args.source
+    if source != "-" and not Path(source).exists() and looks_like_pr_ref(source):
+        return _fetch_source(parse_pr_ref(source))
+
+    return Source(text=_read_input(source), stem=_record_stem(source), label=_source_label(source))
+
+
+def _fetch_source(ref) -> Source:
+    """Fetch a pull request through `gh`.
+
+    The diff is required and its failure aborts the run; the metadata is decoration and its
+    failure is silent (`fetch_pr_info` returns None). Losing a title is not a reason to
+    throw away a review that already arrived.
+    """
+    text = fetch_pr_diff(ref)
+    info = fetch_pr_info(ref)
+    return Source(
+        text=text,
+        # `owner/repo#123` contains `/` and `#`; neither belongs in a fixture filename.
+        stem=f"pr-{ref.owner or 'local'}-{ref.repo or 'repo'}-{ref.number}".replace("/", "-"),
+        label=str(ref),
+        pr=info or PullRequestInfo(ref=ref),
+    )
+
+
 def _read_input(source: str) -> str:
     """A path or `-` for stdin. Never shells out to git (§14)."""
     if source == "-":
         return sys.stdin.read()
     return Path(source).read_text()
+
+
+def _source_label(source: str) -> str:
+    return "stdin" if source == "-" else source
 
 
 def _record_stem(source: str) -> str:
@@ -383,28 +546,86 @@ def _to_json(review: Review) -> str:
     return json.dumps(review.public_dict(), indent=2, sort_keys=True, ensure_ascii=False)
 
 
-def _render(args, review: Review, excluded_note: str = "") -> dict[str, str]:
+def _resolve_format(args) -> str:
+    """Resolve `--format auto` to a concrete format.
+
+    Terminal when a human is looking at it, Markdown when something else is. The detection
+    is `stdout.isatty()`, which is the same signal that already decides whether the styled
+    output would have been legible: a redirect or a pipe wants the Markdown that CI, `>`,
+    and `| less` have always got, and defaulting to it is what keeps §18's workflows and
+    every existing script working unchanged.
+    """
+    if args.format != "auto":
+        return args.format
+    return "terminal" if sys.stdout.isatty() else "markdown"
+
+
+@dataclass
+class Report:
+    """A rendered review, ready to be written.
+
+    `emit` is the terminal report's deferred print. It exists because styled output cannot
+    be a string without losing what makes it styled — rich sizes boxes to the real console
+    width and colours them to the real destination, and both are decided by the console
+    object, not recoverable from captured text. So the console-bound path carries a closure
+    instead of a string, and `_write` calls it at the same point it would have printed.
+    Bound for `--output` there is no terminal to size to, and it captures to a string like
+    every other format.
+    """
+
+    artifacts: dict[str, str] = field(default_factory=dict)
+    emit: Callable[[], None] | None = None
+
+
+def _render(
+    args,
+    review: Review,
+    excluded_note: str = "",
+    source: Source | None = None,
+    *,
+    partial: bool = False,
+) -> Report:
     """Produce every artifact `--format` asked for, keyed by extension."""
+    context = (source or Source(text="", stem="")).terminal_context(partial=partial)
+    fmt = _resolve_format(args)
+
+    if fmt == "terminal":
+        if args.output:
+            return Report(artifacts={"term": render_terminal_str(review, excluded_note, context)})
+        return Report(
+            emit=prepare_terminal(
+                review, excluded_note, context, console=build_console(no_color=args.no_color)
+            )
+        )
+
     artifacts: dict[str, str] = {}
-    if args.format in ("markdown", "both"):
+    if fmt in ("markdown", "both"):
         artifacts["md"] = render_markdown(review, excluded_note)
-    if args.format in ("json", "both"):
+    if fmt in ("json", "both"):
         artifacts["json"] = _to_json(review) + "\n"
-    return artifacts
+    return Report(artifacts=artifacts)
 
 
-def _write(args, artifacts: dict[str, str]) -> None:
+def _write(args, report: Report) -> None:
     """Write to `--output` or stdout.
 
     `--format both` needs two destinations, and CI wants both as named artifacts (§18), so
     the JSON takes the output path with a `.json` suffix. Without `--output` both go to
     stdout in a fixed order — Markdown first, since that is the one a human is reading.
     """
+    if report.emit is not None:
+        report.emit()
+        return
+
+    artifacts = report.artifacts
     if not args.output:
         print("\n".join(artifacts[key].rstrip() for key in ("md", "json") if key in artifacts))
         return
 
     path = Path(args.output)
+    if "term" in artifacts:
+        path.write_text(artifacts["term"])
+        return
     if "md" in artifacts:
         path.write_text(artifacts["md"])
     if "json" in artifacts:
@@ -418,9 +639,9 @@ def _write(args, artifacts: dict[str, str]) -> None:
         json_path.write_text(artifacts["json"])
 
 
-def _emit(args, review: Review) -> None:
+def _emit(args, review: Review, source: Source | None = None) -> None:
     """Render and write in one step, for the paths that return before the full pipeline."""
-    _write(args, _render(args, review))
+    _write(args, _render(args, review, "", source))
 
 
 # --------------------------------------------------------------------------------------
@@ -451,16 +672,10 @@ class Timings:
     def total(self) -> float:
         return sum(self._elapsed.values())
 
-    def report(self) -> str:
-        """`timings: parse 1.2ms · mask 8.4ms · … · total 2.31s`."""
-        if not self._elapsed:
-            return "timings: (none recorded)"
-        stages = " · ".join(f"{name} {_duration(s)}" for name, s in self._elapsed.items())
-        return f"timings: {stages} · total {_duration(self.total)}"
-
-
-def _duration(seconds: float) -> str:
-    return f"{seconds * 1000:.1f}ms" if seconds < 1 else f"{seconds:.2f}s"
+    @property
+    def stages(self) -> tuple[tuple[str, float], ...]:
+        """Pipeline order, since that is insertion order. Formatting belongs to `terminal`."""
+        return tuple(self._elapsed.items())
 
 
 if __name__ == "__main__":  # pragma: no cover

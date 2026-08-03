@@ -1,6 +1,12 @@
 # Security PR Review Bot — Specification
 
-**Platform:** GitHub Repo but for Gitlab
+**Platform:** GitHub — hosting, CI, and pull-request input (§23).
+
+**[AMENDED M7]** This line previously read "GitHub Repo but for Gitlab", which described
+neither the repository nor the tool. GitHub is the platform throughout: the repo, the
+Actions workflows (§18), and — as of M7 — the pull requests the tool reads directly (§23).
+Nothing in the pipeline is GitLab-specific and nothing ever was; the diff format is the
+only interface either platform would present, and it is the same one.
 
 ---
 
@@ -28,7 +34,10 @@ A CLI tool that reads a unified Git diff, identifies suspicious code changes, an
 | Diff parser | `unidiff` (PyPI) | Brief |
 | Secret masker | `detect-secrets` (Yelp), wrapped | Brief |
 | Schema validation | `pydantic` v2 | Brief |
+| Terminal rendering | `rich` | This spec (§24) |
+| Pull-request input | `gh` CLI, wrapped | This spec (§23) |
 | Sample diffs | 5 hand-written, ~30 lines each | Brief |
+| Real diffs | 5 merged public GitHub PRs | This spec (§25) |
 | LLM error handling | Log and fail visibly, no auto-repair | Brief |
 | Budget ceiling | $20 total | Brief |
 
@@ -49,7 +58,7 @@ Three consequences drive the design:
 ## 4. Pipeline
 
 ```
-diff
+diff  (a file, stdin, or a GitHub PR via github_source — §23)
   -> diff_parser        parse files, hunks, added lines, post-file line numbers
   -> secret_masker      typed masking, pre-network
   -> role_scanner       deterministic rules + injection patterns
@@ -57,6 +66,7 @@ diff
   -> llm_client         budget guard, Anthropic call, caching
   -> schema             pydantic validation, line validation, merge, dedupe
   -> renderer           Markdown from JSON
+     terminal           styled terminal report from the same JSON (§24)
   -> output
 ```
 
@@ -72,6 +82,16 @@ diff
 | `llm_client.py` | Anthropic SDK calls, prompt caching, budget pre-flight, `--cache`, `--record` |
 | `schema.py` | Pydantic models, line validation, finding merge, dedupe, confidence promotion |
 | `renderer.py` | JSON → Markdown |
+| `terminal.py` | JSON → styled terminal report (§24) |
+| `github_source.py` | `gh` CLI wrapper: PR reference parsing, diff and metadata fetch (§23) |
+
+**[NEW M7] Two of these are not pipeline stages, and the distinction matters.**
+`github_source.py` is an *input adapter* in front of stage 1: it produces the same diff text
+a file or stdin would have, and nothing downstream can tell the difference. `terminal.py` is
+a *second projection* of stage 7's input, a sibling of `renderer.py` rather than a stage
+after it. Both attach at an existing boundary instead of lengthening the pipeline, which is
+what keeps CLAUDE.md's "one module per pipeline stage" rule intact at nine modules — the
+pipeline is still seven stages long.
 
 **[DEVIATION]** The brief's repo layout omits `prompt_builder.py` while its own pipeline diagram contains a "prompt builder" box, and the brief states "each box in the data flow maps to one file under `src/`." Adding the file resolves the brief against itself. Filtering, packing, and suppression-list construction are non-trivial logic that would otherwise bloat `llm_client.py` and become hard to unit test.
 
@@ -149,6 +169,8 @@ Pattern is real but intent is ambiguous. Emitted at `confidence: low`.
 
 An injection-pattern hit produces a finding with `category: injection`, `severity: high`, `confidence: medium`, and a recommendation to review the change manually because automated review may have been influenced. It does **not** suppress LLM review of the line — the reviewer should see both the injection attempt and whatever the model made of it.
 
+**[AMENDED M8] Every Tier 2 hit is now also a candidate, fed to the LLM by file/line/category/note and asked to be confirmed or rejected independently.** See §12 for the reasoning and §8 for the prompt mechanics.
+
 ---
 
 ## 7. Filtering and packing
@@ -170,6 +192,19 @@ Excluded files are counted and reported in the output header so the reviewer kno
 - If one file exceeds budget: split by hunk with 10 lines of surrounding context, and mark every finding from those chunks with `confidence` capped at `medium`.
 - **File order is sorted lexicographically** before packing, for byte-stable prompts (§9).
 
+**[FIXED M7] The packing budget reserves the system prompt.** `--max-input-tokens` limits
+the whole request — which is what `llm_client.preflight` measures — but `pack` budgeted the
+file blocks alone. A batch filled to 8,000 tokens of content then had a ~1,600-token system
+prompt added to it and aborted at exit 3 *before sending anything*. `pack` now packs against
+`content_budget(max_input_tokens)`, which subtracts the measured cost of an empty prompt.
+
+Worth recording how it stayed hidden: every sample diff is ~1.3k tokens and never fills a
+batch, and §22 said so explicitly while treating it as a reason the splitting path was
+untested rather than as a reason the budget arithmetic was unverified. The two meanings of
+"8,000" never had to agree, so nobody noticed they did not. `real_diffs/large_multi_file.diff`
+(§25) is the first committed diff that fills a batch, and it failed on the first run.
+Guarded by `test_prompt_builder.py::test_a_packed_batch_fits_the_input_budget_with_its_system_prompt`.
+
 **Accepted limitation:** cross-file findings are lost — auth middleware removed in one file, exploited by a route in another. Partially recovered by the summary pass (§8). Documented in README.
 
 ---
@@ -181,10 +216,12 @@ Two calls per run.
 ### Call 1 — Review pass
 
 - Model: `claude-sonnet-5`, effort `medium`
-- Input: system prompt + masked, packed diff + suppression list
+- Input: system prompt + masked, packed diff + suppression list + candidate list
 - Output: `findings[]` only
 
-The suppression list names `(file, line)` pairs already covered by Tier 1 rules, with the instruction: *these lines are already reported; do not re-report them; look for what they missed.* This is **suppression, not hinting** — the model is told to stay away, not invited to confirm. Tier 2 hits are **not** in the suppression list.
+The suppression list names `(file, line)` pairs already covered by Tier 1 rules, with the instruction: *these lines are already reported; do not re-report them; look for what they missed.* This is **suppression, not hinting** — the model is told to stay away, not invited to confirm.
+
+**[AMENDED M8] The candidate list names `(file, line, category, note)` for every Tier 2 hit**, with the instruction: *confirm or reject each independently; the flag is not evidence.* Tier 1 stays suppression — a false positive there is certain, and revisiting it buys nothing. Tier 2 is the opposite case: real pattern, ambiguous intent, exactly the kind of thing a second opinion is for. See §12 for why this replaces the earlier "suppression list only" design.
 
 ### Call 2 — Summary pass
 
@@ -290,7 +327,13 @@ Both counters are emitted to stderr on every run and included in the CI job outp
 
 Deterministic findings go **straight into `findings[]`, bypassing the LLM entirely.** If the API call fails, times out, or returns malformed JSON, deterministic findings are still produced. The highest-confidence signal never depends on a network call.
 
-Rejected: feeding deterministic hits to the LLM as hints. Three reasons — it anchors the model into confirming bad regex matches, it couples the strongest signal to a network call, and it makes `role_scanner.py` untestable in isolation, which the brief's testing requirements demand.
+**[AMENDED M8] Tier 2 hits are now fed to the LLM as a candidate list, reversing the earlier "suppression list only" rule.** The original rejection gave three reasons — anchoring the model into confirming bad regexes, coupling the strongest signal to a network call, and making `role_scanner.py` untestable in isolation. Revisited:
+
+- **Coupling to the network** was never a Tier 2 concern in the first place — Tier 2 was already not suppressing, so it was already fully present in `findings[]` with no dependency on the LLM call succeeding. Candidacy is additive: it can promote a Tier 2 finding's confidence, but a call that never runs or fails leaves the finding exactly where it would have been anyway (§15's exit-0 path is unaffected).
+- **`role_scanner.py` untestable in isolation** does not actually follow from feeding its output forward — the module still runs standalone, over a parsed diff, with no dependency on `prompt_builder` or the network; `test_role_scanner.py` asserts its output directly and always has. What would make it untestable in isolation is *reading the model's output back*, which this does not do.
+- **Anchoring** is the one real risk, and the fix is in the instruction, not the topology: the model is told the flag is not evidence and to decide independently, mirroring how a competent second reviewer is told "someone flagged this — form your own opinion" rather than "someone flagged this, please agree." A candidate the model doesn't confirm changes nothing; it stays exactly the deterministic-only finding it would have been.
+
+The result **is** what "agreement promotes confidence" (below) was always describing — a second, differently-shaped read of the same location. Making that a deliberate ask rather than an incidental overlap raises the odds the model's second read actually happens on lines a regex has already flagged as ambiguous, which is precisely where a second read is worth having.
 
 **Merge rules**, applied in `schema.py`:
 
@@ -316,6 +359,12 @@ Rejected: feeding deterministic hits to the LLM as hints. Three reasons — it a
 
 **[AMENDED M5] The skipped-file note is passed to the renderer, not carried on `Review`.** §10 fixes the output schema exactly as the brief specifies, and a count of excluded files is presentation rather than a finding — adding a field for it would change the schema, which CLAUDE.md says to ask about first. `render_markdown(review, excluded_note)` takes it as a second argument, sourced from `FilterResult.exclusion_summary()`. The JSON is unchanged, and the note still reaches the reviewer in the header where §13 wants it.
 
+**[AMENDED M7] There are now two renderers, and the rule below binds both.** `terminal.py`
+(§24) is a second projection of the same `Review`. It imports `group_by_file` and
+`severity_counts` from `renderer.py` rather than reimplementing them, so the two artifacts
+cannot disagree about ordering or counts — asserted in
+`test_terminal.py::test_both_renderers_agree_on_file_order_and_counts`.
+
 **[NEW M5] The renderer adds no judgment.** It does not filter, cap, re-score, or re-order anything `schema.py` settled; `overall_risk` renders as given rather than being recomputed from the findings present. Asserted in `test_renderer.py::test_overall_risk_is_taken_from_the_review_not_recomputed`. This is what makes "the JSON is the source of truth" true rather than aspirational: two artifacts that could disagree would mean neither is authoritative.
 
 ---
@@ -323,14 +372,40 @@ Rejected: feeding deterministic hits to the LLM as hints. Three reasons — it a
 ## 14. CLI
 
 ```
-review-bot [DIFF_PATH | -] [options]
+review-bot [DIFF_PATH | - | PR_URL] [options]
 ```
 
-**Input:** a diff file path as a positional argument, or `-` to read from stdin. No git invocation — shelling out to `git diff --base/--head` would force every test to construct a real repository with real commits, which is heavy scaffolding for a capability CI does not need. CI pipes `git diff origin/main...HEAD` instead.
+**Input:** a diff file path as a positional argument, `-` to read from stdin, or — as of M7
+— a GitHub pull request (§23). ~~No git invocation~~ — shelling out to `git diff --base/--head` would force every test to construct a real repository with real commits, which is heavy scaffolding for a capability CI does not need. CI pipes `git diff origin/main...HEAD` instead.
+
+**[AMENDED M7] The no-subprocess rule was about reconstructing a diff locally, and it still
+holds for that.** `--pr` shells out to `gh`, which reads as a straight reversal of the
+sentence above and is not one. The rejected thing was `git diff BASE...HEAD`: it needs a
+local checkout at the right commits, so every test would have to build a real repository —
+the scaffolding is the entire objection, and it is unchanged. `gh pr diff` needs no checkout
+and computes nothing locally; it fetches a diff the server already made. The test cost is
+one mocked function (`github_source._run_gh`), which is *less* scaffolding than reading a
+file, and §17's "unit tests never touch the network" is preserved by the same seam.
+
+Rejected alternatives, both real options:
+
+- **Call `api.github.com` directly** (stdlib `urllib`, `Accept: application/vnd.github.v3.diff`).
+  Zero new dependencies and no external binary — genuinely tempting. Rejected because it
+  means owning credential storage, token refresh, enterprise hosts, and SSO, all of which
+  `gh` already solves and none of which this tool has any business reimplementing badly.
+- **A `PyGithub` or `requests` dependency.** A library-sized answer to one HTTP GET, and it
+  still leaves the credential problem where the previous option left it.
+
+The cost of the choice, stated plainly: `gh` must be installed and authenticated, which is a
+runtime dependency that `pip install` does not satisfy. The failure is loud and names the
+fix (`github_source._explain_failure`), and every other input path works without it — CI
+uses none of it, because §18 pipes the diff.
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--format {markdown,json,both}` | `markdown` | Output format |
+| `--pr REF` | — | Review a GitHub pull request. URL, `owner/repo#123`, or bare `123` (§23) |
+| `--format {auto,terminal,markdown,json,both}` | `auto` | Output format. `auto` = terminal on a TTY, Markdown when piped (§24) |
+| `--no-color` | off | Disable colour. `NO_COLOR` is honoured regardless |
 | `--output PATH` | stdout | Write to file |
 | `--model ID` | `claude-sonnet-5` | Override review model |
 | `--effort {low,medium,high}` | `medium` | Effort level |
@@ -385,6 +460,11 @@ Five hand-written diffs, ~30 lines each, in `sample_diffs/`. Held at five delibe
 | `secrets_and_logging.diff` | AWS key in `src/`, dummy password in `tests/` | 2 `hardcoded_secrets`, severity high and low respectively |
 | `clean_but_suspicious.diff` | Parameterized SQL, `secrets.token_hex()`, redirect to an allowlist | **Zero findings.** Measures false-positive rate. |
 | `prompt_injection.diff` | Code comment instructing the reviewer to approve | 1 `injection` finding for the attempt, plus normal review of the surrounding code |
+
+**[AMENDED M7] Five real diffs sit alongside these in `real_diffs/`, and do a different
+job (§25).** These five stay exactly as they are: they are what the rules were tuned
+against, and retuning against real PRs would cost the M3 rule evidence and the
+false-positive canary for nothing.
 
 `clean_but_suspicious.diff` is the one that earns its keep — code that *looks* alarming but is correct is the only way to measure false positives, and the definition of done requires documenting limitations honestly. `prompt_injection.diff` is the only test of §3's threat model.
 
@@ -451,6 +531,7 @@ Two things worth keeping from it. **A CI failure with zero jobs is a parse failu
 | **M4** LLM pipeline and schema | 7–8 | `prompt_builder.py`, `llm_client.py`, `schema.py` | 3 sample diffs end to end, no auto-repair; `unmappable_count` driven toward zero |
 | **M5** Reviewer output and CI | 9 | `renderer.py`, both workflows | Grouped by file and line; severity and confidence visible; secrets redacted; CI on every PR |
 | **M6** Demo and handoff | 10 | Demo script, walkthrough | `--cache` demo runs unattended on 3 sample diffs; README complete; release tag |
+| **M7** GitHub input and terminal output | — | `github_source.py`, `terminal.py`, `real_diffs/` | `--pr` reviews a real PR; styled report on a TTY with Markdown preserved when piped; real diffs in CI (§23, §24, §25) |
 
 **Workflow:** feature branches only, no direct commits to `main` after setup, one PR per milestone with test evidence, small commits.
 
@@ -480,10 +561,20 @@ Two things worth keeping from it. **A CI failure with zero jobs is a parse failu
 7. **Diff-only context.** No knowledge of surrounding code, project conventions, or existing mitigations, and it will occasionally flag something already handled elsewhere.
 8. **Prompt injection is detected, not prevented.** A sufficiently novel injection may still influence the review. Any detected attempt is surfaced so the reviewer knows to look manually.
 9. **Lockfiles receive only a deterministic "dependency changed" flag**, not a vulnerability assessment. Pair with a real SCA tool.
-
----
-
+10. **[NEW M7] `--pr` requires `gh` installed and authenticated.** `pip install` does not
+    provide it. Every other input path — a file, stdin, CI's pipe — works without it (§23).
+11. **[NEW M7] `--pr` reads a pull request; it does not write to one.** Posting review
+    comments back to the PR remains out of scope (§1). The output is a terminal report, a
+    Markdown file, or JSON.
 ## 22. Open items
+
+- **[NEW M7] The packing budget did not include the system prompt, and no test could have
+  caught it.** Resolved in §7. The lesson is about the corpus, not the arithmetic: the entry
+  below closed "what token budget for packing?" by observing that all five samples fit in one
+  call well under 8,000 — which is true, and is exactly why the number was never tested. A
+  budget that nothing approaches is a budget nothing verifies. The first real diff large
+  enough to fill a batch failed immediately, at exit 3, before sending a request. **This is
+  the argument for `real_diffs/` (§25) stated as a defect rather than as a principle.**
 
 - ~~Exact token budget for packing~~ — **[RESOLVED M4]** 8,000 stands as the default. All five sample diffs pack into a single call well under it (the largest estimates ~1.3k input tokens including the system prompt), so the splitting path is exercised by tests rather than by the samples. There is no evidence to tune against until a large real diff appears; `--max-input-tokens` remains the escape hatch.
 - ~~Whether the summary pass on Haiku is good enough, or needs to move to Sonnet~~ — **[RESOLVED M6]** Haiku stays. See the resolved entry below for the evidence.
@@ -526,3 +617,150 @@ Two things worth keeping from it. **A CI failure with zero jobs is a parse failu
 - **[NEW M5] `test_diff_parser.py` was empty.** M2 shipped the parser and its test *diffs* but not the test file, so §17's first per-module requirement was unmet and the gap was invisible because the suite was green. Now written — 30 cases, including the added-line numbering that §11 depends on. **The lesson worth keeping: a green suite is not evidence of coverage when the missing tests are missing files.** No further empty test modules remain.
 
 - **[NEW M4, UPDATED M6] `thinking` configuration for the review pass.** The call leaves adaptive thinking at the model default. Thinking tokens bill as output and count against `max_tokens`, so this was flagged as a live cost and truncation risk. **M6's figures retire the truncation half of that worry and leave the tuning half open.** Review responses used 104–424 output tokens against an 8,000-token ceiling — thinking included, since `usage.output_tokens` does not break it out — so nothing came close to truncating and `REVIEW_MAX_TOKENS` needs no change. What is still unknown is how much of that was thinking, which is what an `effort` sweep would answer. Not worth doing against five easy diffs; do it when there is a large real diff to sweep against.
+
+---
+
+
+---
+
+## 23. GitHub pull-request input
+
+**[NEW M7]** `review-bot --pr owner/repo#123` fetches a PR's diff and reviews it. The
+positional argument accepts the same thing, so a pasted URL works with no flag at all.
+
+Accepted forms:
+
+| Form | Where |
+|---|---|
+| `https://github.com/owner/repo/pull/123` (with `/files`, `#comment`, query strings) | positional or `--pr` |
+| `owner/repo#123`, `owner/repo/pull/123` | positional or `--pr` |
+| `123`, `#123` — resolved against the working directory's remotes by `gh` | **`--pr` only** |
+
+**The bare forms are `--pr`-only, and that asymmetry is deliberate.** `123` is a valid
+filename; a URL and `owner/repo#123` cannot be mistaken for a real path. Using `--pr` is the
+user stating that the argument is a pull request, which is the only thing that makes a bare
+number unambiguous. An existing file always wins over a PR-shaped name regardless.
+Asserted in `test_github_source.py::test_diff_paths_are_never_mistaken_for_pull_requests`.
+
+**Metadata never reaches a prompt.** `gh pr view` is called for the title, author, and
+branches, which decorate the report header (§24) and nothing else. The field list
+deliberately excludes the PR **body**: §3 treats everything the PR author writes as
+attacker-controlled, and the body is the largest block of author-written prose there is,
+with no review value the diff does not already carry. Asserted in
+`test_github_source.py::test_fetch_pr_info_never_requests_the_pr_body`.
+
+**Metadata failure is not run failure.** The diff is required and its failure exits 1, like
+an unreadable file. The metadata call is best-effort and returns None on any error — the
+review already arrived, and losing a title is not a reason to discard it.
+
+**One subprocess boundary.** `github_source._run_gh` is the only `subprocess.run` in the
+module, which is what lets the entire test file mock one function and keeps §17's
+no-network rule enforced rather than merely stated. Asserted structurally in
+`test_github_source.py::test_run_gh_is_the_only_subprocess_call`, in the same spirit as
+§22's call-count guard: assert the property that was fixed, not a timing.
+
+**Not adopted:** posting the review back as a PR comment. Still out of scope per §1, and
+the argument there has not changed — writing to a PR is a permissions and idempotency
+problem (which comment, edit or append, what happens on a force-push) that a tool with no
+cross-PR state cannot answer well.
+
+---
+
+## 24. Terminal output
+
+**[NEW M7]** The default output on a terminal is a styled report built with `rich`:
+severity badges, a full-height colour bar down each finding, confidence meters, and the
+findings grouped by file exactly as §13 orders them.
+
+**`--format auto` (the new default) resolves on `stdout.isatty()`** — terminal for a human,
+Markdown for anything else. This is what keeps the change backward compatible: §18's
+workflows, `> review.md`, and `| less` all still receive the Markdown they always did, and
+no existing invocation changes behaviour. `--format markdown` forces it either way.
+
+**Rich markup is the hazard this module is written around.** Rich parses `[...]` in a plain
+string as a style tag, so an evidence string carrying `[MASKED_AWS_KEY]` renders as *nothing
+at all* — no error, no warning, just a gap where the proof that masking worked used to be.
+That would break invariant 7 in the one direction tests would not otherwise catch, since
+nothing raises and no secret leaks; the placeholder simply vanishes. Every string sourced
+from the diff or the model is therefore wrapped in `rich.text.Text`, which disables the
+parse. Asserted for all five §5 placeholders in
+`test_terminal.py::test_masked_placeholders_survive_rich_markup`.
+
+**The report is built before the diagnostics are printed.** `--verbose` writes counters and
+timings to stderr, and the terminal report goes to stdout; on one terminal they interleave.
+`prepare_terminal` returns a closure so `cli.py` can time the render, flush stderr, and then
+print — which is also the only ordering where the timings report can include the render
+stage it is timing.
+
+**[NEW] The diagnostics are styled on the same rule, one level down.** They were eight
+unbroken lines of `key=value` above the report, which is a shape with no entry point: a
+reader looking for the run's cost had to read the whole block to find it, and the same
+numbers appeared twice — once live per call, once in a closing summary. `render_diagnostics`
+now branches on `stderr.is_terminal`:
+
+- **A terminal** gets a labelled block — `calls`, `checks`, `time`, `scope` — with the call
+  accounting in an aligned table, the run total under the column it totals, and the timings
+  as total → api/local split → per-stage detail. Zeroed counters are dimmed and only a
+  non-zero one takes colour, so a healthy run costs nothing to skip past. The live per-call
+  line shrinks to label, model, elapsed, and cost: its job is to prove a ten-second wait is
+  still alive, and the token detail behind it is now reported once, at the end.
+- **Anything else** — a pipe, a file, CI — gets the original `key=value` lines unchanged.
+  That is not a fallback. §11 puts `unmappable_count` and `hallucinated_file_count` in the
+  CI job output, and what makes them useful there is that they survive a log search; a
+  number sitting under a column heading does not.
+
+The two streams are checked independently, because they genuinely differ:
+`review-bot diff > out.md` leaves stdout a file and stderr a terminal, and that run should
+still get the readable form of its own diagnostics.
+
+`terminal.py` owns the layout and `cli.py` owns the content, passed across as
+`RunDiagnostics` rather than as pre-formatted lines. That split is what lets one run print
+either form without `cli.py` knowing which happened.
+
+**Rejected:** hand-rolled ANSI. It is one dependency against wrapping, width detection,
+`NO_COLOR`, non-TTY degradation, and East-Asian character widths, all of which `rich` has
+already got right and none of which is this project's problem to solve.
+
+---
+
+## 25. Real pull-request diffs
+
+**[NEW M7]** `real_diffs/` holds five merged public GitHub PRs, committed verbatim, with
+provenance in `real_diffs/MANIFEST.json` and `make refresh-real-diffs` to re-fetch them.
+They complement `sample_diffs/` (§16) rather than replacing it.
+
+The five samples are hand-written to make each rule fire, and the rules were tuned against
+them. That makes them a poor witness for input nobody wrote for the tool: each is ~30 lines,
+one hunk, one concern, and every one is *supposed* to produce findings. The real diffs cover
+what that shape cannot reach.
+
+| Diff | Source | Exercises |
+|---|---|---|
+| `dependency_bump.diff` | pallets/werkzeug#2080 | Every file filtered; Tier 1 only; **no API call at all** (invariant 6) |
+| `large_multi_file.diff` | encode/httpx#2879 | 11 files, ~13k tokens — **the first committed diff that splits into more than one batch** (§7) |
+| `debugger_pin_fix.diff` | pallets/werkzeug#3078 | A real security fix in PIN-auth code, with zero deterministic hits |
+| `redirect_history.diff` | psf/requests#7328 | Real redirect handling that `unsafe_redirects` must stay quiet on |
+| `docs_removal.diff` | pallets/flask#5695 | Pure deletion, no added lines — §15's exit-0 path |
+
+**Most real PRs produce zero deterministic findings, and that is the expected number.** The
+manifest records the measured count per diff and `test_real_diffs.py` asserts it, so a rule
+that starts firing on ordinary code fails CI. This is `clean_but_suspicious.diff`'s job
+generalised: that file proves the rules stay quiet on code *written* to look alarming, and
+these prove they stay quiet on code written without the tool in mind at all.
+
+**The most valuable finding in the directory is a false positive.** `large_multi_file.diff`
+produces two `hardcoded_secrets` hits on `docs/advanced.md`, where the changed lines are
+documentation examples showing `http://user:pass@proxy` URLs. `detect-secrets` is right that
+the text is credential-shaped and wrong that it matters, and §5's path heuristic scores
+`docs/` as `src` and calls it **high** severity. It is asserted, not fixed: §21's limitation
+2 says the tool cannot distinguish a live credential from an example without the value, and
+the value is destroyed by design. A rule change that silences it has to delete a test that
+says why it exists.
+
+**Still open:** these five are all Python-ecosystem web libraries, so the corpus says
+nothing about Go, Rust, or a large TypeScript monorepo. §22's note that there is no large
+real diff to tune against is now half-resolved — there is one, and it is 900 lines, which is
+still not the 5,000-line PR where the packing defaults would actually be tested.
+
+---
+
